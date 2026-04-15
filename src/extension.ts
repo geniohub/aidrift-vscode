@@ -4,17 +4,21 @@ import { ApiClient, ApiError } from "./api-client";
 import { ClaudeCodeWatcher } from "./watchers/claude-code-watcher";
 import { SessionManager } from "./session-manager";
 import { StatusPoller } from "./status-poller";
+import { SessionsTreeProvider } from "./views/sessions-tree";
 
 let statusBar: vscode.StatusBarItem;
 let apiClient: ApiClient;
 let sessionManager: SessionManager;
 let watcher: ClaudeCodeWatcher | undefined;
 let poller: StatusPoller | undefined;
+let treeProvider: SessionsTreeProvider | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   console.log(`[aidrift] activating v${VERSION}`);
   apiClient = new ApiClient(context.secrets);
   sessionManager = new SessionManager(apiClient);
+  sessionManager.start();
+  context.subscriptions.push({ dispose: () => sessionManager.stop() });
 
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBar.show();
@@ -29,6 +33,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   poller.start();
   context.subscriptions.push({ dispose: () => poller?.stop() });
 
+  treeProvider = new SessionsTreeProvider(apiClient);
+  context.subscriptions.push(
+    vscode.window.registerTreeDataProvider("aidrift.sessions", treeProvider),
+  );
+  treeProvider.startAutoRefresh();
+  context.subscriptions.push({ dispose: () => treeProvider?.stopAutoRefresh() });
+
   context.subscriptions.push(
     vscode.commands.registerCommand("aidrift.login", () => loginFlow()),
     vscode.commands.registerCommand("aidrift.logout", () => logoutFlow()),
@@ -38,6 +49,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("aidrift.createCheckpoint", () => createCheckpointFlow()),
     vscode.commands.registerCommand("aidrift.showStatus", () => showStatusFlow()),
     vscode.commands.registerCommand("aidrift.openActiveInDashboard", () => openActiveInDashboard()),
+    vscode.commands.registerCommand("aidrift.openSessionInDashboard", (sessionId?: string) => openSessionInDashboard(sessionId)),
+    vscode.commands.registerCommand("aidrift.refreshSessions", () => treeProvider?.refresh()),
   );
 
   // Start the watcher if already signed in.
@@ -183,9 +196,12 @@ function showStatusFlow(): void {
 }
 
 function openActiveInDashboard(): void {
-  const sid = sessionManager.getActiveSessionId();
+  openSessionInDashboard(sessionManager.getActiveSessionId() ?? undefined);
+}
+
+function openSessionInDashboard(sessionId?: string): void {
   const base = vscode.workspace.getConfiguration("aidrift").get<string>("dashboardUrl") ?? "http://localhost:3331";
-  const url = sid ? `${base}/sessions/${sid}` : `${base}/sessions`;
+  const url = sessionId ? `${base}/sessions/${sessionId}` : `${base}/sessions`;
   void vscode.env.openExternal(vscode.Uri.parse(url));
 }
 

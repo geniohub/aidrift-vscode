@@ -20,8 +20,36 @@
       { "command": "aidrift.rejectLastTurn", "title": "Drift: Mark Last Turn Rejected" },
       { "command": "aidrift.createCheckpoint", "title": "Drift: Create Checkpoint for Active Session" },
       { "command": "aidrift.showStatus", "title": "Drift: Show Status for Active Session" },
-      { "command": "aidrift.openActiveInDashboard", "title": "Drift: Open Active Session in Dashboard" }
+      { "command": "aidrift.openActiveInDashboard", "title": "Drift: Open Active Session in Dashboard" },
+      { "command": "aidrift.openSessionInDashboard", "title": "Drift: Open Session in Dashboard" },
+      { "command": "aidrift.refreshSessions", "title": "Drift: Refresh Sessions", "icon": "$(refresh)" }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "aidrift",
+          "title": "AI Drift",
+          "icon": "$(pulse)"
+        }
+      ]
+    },
+    "views": {
+      "aidrift": [
+        {
+          "id": "aidrift.sessions",
+          "name": "Recent Sessions"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "aidrift.refreshSessions",
+          "when": "view == aidrift.sessions",
+          "group": "navigation"
+        }
+      ]
+    },
     "configuration": {
       "title": "AI Drift Detector",
       "properties": {
