@@ -28,7 +28,7 @@
         "aidrift.apiBaseUrl": {
           "type": "string",
           "default": "http://localhost:3331/api",
-          "description": "AI Drift backend API base URL. Defaults to the frontend origin (which proxies to the api container) so everything flows through one port."
+          "description": "AI Drift API base URL. Single public origin for all clients (dashboard, extension, CLI). In local dev this is the frontend container (which proxies /api/* to the api container). In SaaS deployment set this to e.g. https://aidrift.example.com/api."
         },
         "aidrift.dashboardUrl": {
           "type": "string",
