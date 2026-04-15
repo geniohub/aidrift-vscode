@@ -13,6 +13,9 @@
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
+      { "command": "aidrift.login", "title": "Drift: Sign In" },
+      { "command": "aidrift.logout", "title": "Drift: Sign Out" },
+      { "command": "aidrift.whoami", "title": "Drift: Show Signed-In User" },
       { "command": "aidrift.startSession", "title": "Drift: Start Session" },
       { "command": "aidrift.acceptLastTurn", "title": "Drift: Mark Last Turn Accepted" },
       { "command": "aidrift.rejectLastTurn", "title": "Drift: Mark Last Turn Rejected" },
@@ -22,10 +25,10 @@
     "configuration": {
       "title": "AI Drift Detector",
       "properties": {
-        "aidrift.dbPath": {
+        "aidrift.apiBaseUrl": {
           "type": "string",
-          "default": "~/.drift/drift.db",
-          "description": "Path to the local SQLite database."
+          "default": "http://localhost:3330",
+          "description": "AI Drift backend API base URL (docker-compose default port)."
         },
         "aidrift.watchClaudeCode": {
           "type": "boolean",
