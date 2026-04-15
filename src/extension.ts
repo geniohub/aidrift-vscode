@@ -1,43 +1,72 @@
 import * as vscode from "vscode";
 import { VERSION } from "@aidrift/core";
 import { ApiClient, ApiError } from "./api-client";
+import { ClaudeCodeWatcher } from "./watchers/claude-code-watcher";
+import { SessionManager } from "./session-manager";
+import { StatusPoller } from "./status-poller";
 
 let statusBar: vscode.StatusBarItem;
 let apiClient: ApiClient;
+let sessionManager: SessionManager;
+let watcher: ClaudeCodeWatcher | undefined;
+let poller: StatusPoller | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   console.log(`[aidrift] activating v${VERSION}`);
   apiClient = new ApiClient(context.secrets);
+  sessionManager = new SessionManager(apiClient);
 
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBar.show();
   context.subscriptions.push(statusBar);
-  await refreshStatusBar();
+
+  poller = new StatusPoller(
+    apiClient,
+    statusBar,
+    () => sessionManager.getActiveSessionId(),
+    () => sessionManager.getActiveTaskDescription(),
+  );
+  poller.start();
+  context.subscriptions.push({ dispose: () => poller?.stop() });
 
   context.subscriptions.push(
     vscode.commands.registerCommand("aidrift.login", () => loginFlow()),
     vscode.commands.registerCommand("aidrift.logout", () => logoutFlow()),
     vscode.commands.registerCommand("aidrift.whoami", () => whoamiFlow()),
-    vscode.commands.registerCommand("aidrift.startSession", () => stub("startSession", "Phase 3")),
-    vscode.commands.registerCommand("aidrift.acceptLastTurn", () => stub("acceptLastTurn", "Phase 3")),
-    vscode.commands.registerCommand("aidrift.rejectLastTurn", () => stub("rejectLastTurn", "Phase 3")),
-    vscode.commands.registerCommand("aidrift.createCheckpoint", () => stub("createCheckpoint", "Phase 5")),
-    vscode.commands.registerCommand("aidrift.showStatus", () => stub("showStatus", "Phase 5")),
+    vscode.commands.registerCommand("aidrift.acceptLastTurn", () => setLastTurnOutcome("accepted")),
+    vscode.commands.registerCommand("aidrift.rejectLastTurn", () => setLastTurnOutcome("rejected")),
+    vscode.commands.registerCommand("aidrift.createCheckpoint", () => createCheckpointFlow()),
+    vscode.commands.registerCommand("aidrift.showStatus", () => showStatusFlow()),
+    vscode.commands.registerCommand("aidrift.openActiveInDashboard", () => openActiveInDashboard()),
   );
-}
 
-async function refreshStatusBar(): Promise<void> {
-  const email = await apiClient.getEmail();
-  if (email) {
-    statusBar.text = "$(pulse) Drift —";
-    statusBar.tooltip = `Signed in as ${email} — no active session yet`;
-    statusBar.command = "aidrift.showStatus";
-  } else {
-    statusBar.text = "$(account) Drift: sign in";
-    statusBar.tooltip = "Click to sign in to AI Drift";
-    statusBar.command = "aidrift.login";
+  // Start the watcher if already signed in.
+  if (await apiClient.isSignedIn()) {
+    await startWatcher();
   }
 }
+
+async function startWatcher(): Promise<void> {
+  if (watcher) return;
+  if (!vscode.workspace.getConfiguration("aidrift").get<boolean>("watchClaudeCode", true)) return;
+  watcher = new ClaudeCodeWatcher(async (entry) => {
+    await sessionManager.handleEntry(entry);
+  });
+  try {
+    await watcher.start();
+    console.log("[aidrift] Claude Code watcher started");
+  } catch (err) {
+    console.error("[aidrift] watcher failed to start:", err);
+    watcher = undefined;
+  }
+}
+
+async function stopWatcher(): Promise<void> {
+  await watcher?.stop();
+  watcher = undefined;
+}
+
+// ---------- commands ----------
 
 async function loginFlow(): Promise<void> {
   const email = await vscode.window.showInputBox({
@@ -54,8 +83,8 @@ async function loginFlow(): Promise<void> {
   if (!password) return;
   try {
     const user = await apiClient.login(email, password);
-    await refreshStatusBar();
     void vscode.window.showInformationMessage(`Signed in to AI Drift as ${user.email}`);
+    await startWatcher();
   } catch (err) {
     const msg = err instanceof ApiError
       ? `Sign-in failed: ${err.message}`
@@ -66,7 +95,7 @@ async function loginFlow(): Promise<void> {
 
 async function logoutFlow(): Promise<void> {
   await apiClient.logout();
-  await refreshStatusBar();
+  await stopWatcher();
   void vscode.window.showInformationMessage("Signed out of AI Drift");
 }
 
@@ -88,10 +117,80 @@ async function whoamiFlow(): Promise<void> {
   }
 }
 
-function stub(_cmd: string, phase: string): void {
-  void vscode.window.showInformationMessage(`[${phase} stub] not implemented yet`);
+async function setLastTurnOutcome(outcome: "accepted" | "rejected"): Promise<void> {
+  const sid = sessionManager.getActiveSessionId();
+  if (!sid) {
+    void vscode.window.showWarningMessage("No active drift session yet.");
+    return;
+  }
+  try {
+    const turns = await apiClient.request<Array<{ id: string; turnIndex: number }>>(`/sessions/${sid}/turns`);
+    const last = turns.at(-1);
+    if (!last) {
+      void vscode.window.showWarningMessage("No turns in the active session yet.");
+      return;
+    }
+    await apiClient.request(`/turns/${last.id}/outcome`, {
+      method: "PATCH",
+      body: JSON.stringify({ outcome }),
+    });
+    void vscode.window.showInformationMessage(`Marked turn #${last.turnIndex} as ${outcome}.`);
+  } catch (err) {
+    void vscode.window.showErrorMessage(`Failed: ${(err as Error).message}`);
+  }
 }
 
-export function deactivate(): void {
+async function createCheckpointFlow(): Promise<void> {
+  const sid = sessionManager.getActiveSessionId();
+  if (!sid) {
+    void vscode.window.showWarningMessage("No active drift session yet.");
+    return;
+  }
+  const summary = await vscode.window.showInputBox({
+    prompt: "Checkpoint summary",
+    placeHolder: "e.g. auth tests green",
+  });
+  if (!summary) return;
+  try {
+    const turns = await apiClient.request<Array<{ id: string }>>(`/sessions/${sid}/turns`);
+    const last = turns.at(-1);
+    if (!last) {
+      void vscode.window.showWarningMessage("No turns yet.");
+      return;
+    }
+    await apiClient.request(`/sessions/${sid}/checkpoints`, {
+      method: "POST",
+      body: JSON.stringify({ turnId: last.id, summary, source: "manual" }),
+    });
+    void vscode.window.showInformationMessage(`Checkpoint created.`);
+  } catch (err) {
+    void vscode.window.showErrorMessage(`Failed: ${(err as Error).message}`);
+  }
+}
+
+function showStatusFlow(): void {
+  const status = poller?.getLastStatus();
+  if (!status) {
+    void vscode.window.showInformationMessage("No drift status yet.");
+    return;
+  }
+  const alertLine = status.alert.active
+    ? ` — ⚠ drift: ${status.alert.reasons.join("; ")}`
+    : "";
+  void vscode.window.showInformationMessage(
+    `${status.session.taskDescription} — score ${status.currentScore ?? "—"} (${status.trend})${alertLine}`,
+  );
+}
+
+function openActiveInDashboard(): void {
+  const sid = sessionManager.getActiveSessionId();
+  const base = vscode.workspace.getConfiguration("aidrift").get<string>("dashboardUrl") ?? "http://localhost:3331";
+  const url = sid ? `${base}/sessions/${sid}` : `${base}/sessions`;
+  void vscode.env.openExternal(vscode.Uri.parse(url));
+}
+
+export async function deactivate(): Promise<void> {
   statusBar?.dispose();
+  poller?.stop();
+  await stopWatcher();
 }

@@ -16,24 +16,34 @@
       { "command": "aidrift.login", "title": "Drift: Sign In" },
       { "command": "aidrift.logout", "title": "Drift: Sign Out" },
       { "command": "aidrift.whoami", "title": "Drift: Show Signed-In User" },
-      { "command": "aidrift.startSession", "title": "Drift: Start Session" },
       { "command": "aidrift.acceptLastTurn", "title": "Drift: Mark Last Turn Accepted" },
       { "command": "aidrift.rejectLastTurn", "title": "Drift: Mark Last Turn Rejected" },
-      { "command": "aidrift.createCheckpoint", "title": "Drift: Create Checkpoint" },
-      { "command": "aidrift.showStatus", "title": "Drift: Show Status" }
+      { "command": "aidrift.createCheckpoint", "title": "Drift: Create Checkpoint for Active Session" },
+      { "command": "aidrift.showStatus", "title": "Drift: Show Status for Active Session" },
+      { "command": "aidrift.openActiveInDashboard", "title": "Drift: Open Active Session in Dashboard" }
     ],
     "configuration": {
       "title": "AI Drift Detector",
       "properties": {
         "aidrift.apiBaseUrl": {
           "type": "string",
-          "default": "http://localhost:3330",
-          "description": "AI Drift backend API base URL (docker-compose default port)."
+          "default": "http://localhost:3331/api",
+          "description": "AI Drift backend API base URL. Defaults to the frontend origin (which proxies to the api container) so everything flows through one port."
+        },
+        "aidrift.dashboardUrl": {
+          "type": "string",
+          "default": "http://localhost:3331",
+          "description": "Dashboard URL opened by 'Drift: Open Active Session in Dashboard'."
         },
         "aidrift.watchClaudeCode": {
           "type": "boolean",
           "default": true,
-          "description": "Watch ~/.claude/projects/ for new transcripts."
+          "description": "Watch ~/.claude/projects/ for new Claude Code transcripts and auto-track them."
+        },
+        "aidrift.statusPollIntervalSeconds": {
+          "type": "number",
+          "default": 3,
+          "description": "How often the status bar polls /sessions/:id/status."
         },
         "aidrift.watchCodex": {
           "type": "boolean",
@@ -65,7 +75,8 @@
     "test": "echo 'no extension tests yet'"
   },
   "dependencies": {
-    "@aidrift/core": "workspace:*"
+    "@aidrift/core": "workspace:*",
+    "chokidar": "^4.0.1"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",
