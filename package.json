@@ -1,0 +1,72 @@
+{
+  "name": "aidrift-vscode",
+  "displayName": "AI Drift Detector",
+  "description": "Watches your AI coding chats (Claude Code, Codex) and warns when sessions drift.",
+  "version": "0.0.1",
+  "publisher": "aidrift",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "aidrift.startSession", "title": "Drift: Start Session" },
+      { "command": "aidrift.acceptLastTurn", "title": "Drift: Mark Last Turn Accepted" },
+      { "command": "aidrift.rejectLastTurn", "title": "Drift: Mark Last Turn Rejected" },
+      { "command": "aidrift.createCheckpoint", "title": "Drift: Create Checkpoint" },
+      { "command": "aidrift.showStatus", "title": "Drift: Show Status" }
+    ],
+    "configuration": {
+      "title": "AI Drift Detector",
+      "properties": {
+        "aidrift.dbPath": {
+          "type": "string",
+          "default": "~/.drift/drift.db",
+          "description": "Path to the local SQLite database."
+        },
+        "aidrift.watchClaudeCode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Watch ~/.claude/projects/ for new transcripts."
+        },
+        "aidrift.watchCodex": {
+          "type": "boolean",
+          "default": false,
+          "description": "Watch Codex session logs (Phase 7)."
+        },
+        "aidrift.driftAlertThreshold": {
+          "type": "number",
+          "default": 65,
+          "description": "Score below which a drift alert fires."
+        },
+        "aidrift.autoCheckpoint": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-create a checkpoint on every accepted turn."
+        },
+        "aidrift.implicitAcceptTimeoutSeconds": {
+          "type": "number",
+          "default": 300,
+          "description": "Seconds without a follow-up before a turn is treated as implicitly accepted."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "watch": "tsc -p tsconfig.json --watch",
+    "clean": "rm -rf dist",
+    "test": "echo 'no extension tests yet'"
+  },
+  "dependencies": {
+    "@aidrift/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.6.3"
+  }
+}
