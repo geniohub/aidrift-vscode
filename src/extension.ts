@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { VERSION } from "@aidrift/core";
 import { ApiClient, ApiError } from "./api-client";
 import { ClaudeCodeWatcher } from "./watchers/claude-code-watcher";
+import { CodexWatcher } from "./watchers/codex-watcher";
 import { SessionManager } from "./session-manager";
 import { StatusPoller } from "./status-poller";
 import { SessionsTreeProvider } from "./views/sessions-tree";
@@ -9,7 +10,8 @@ import { SessionsTreeProvider } from "./views/sessions-tree";
 let statusBar: vscode.StatusBarItem;
 let apiClient: ApiClient;
 let sessionManager: SessionManager;
-let watcher: ClaudeCodeWatcher | undefined;
+let claudeWatcher: ClaudeCodeWatcher | undefined;
+let codexWatcher: CodexWatcher | undefined;
 let poller: StatusPoller | undefined;
 let treeProvider: SessionsTreeProvider | undefined;
 
@@ -55,28 +57,39 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // Start the watcher if already signed in.
   if (await apiClient.isSignedIn()) {
-    await startWatcher();
+    await startWatchers();
   }
 }
 
-async function startWatcher(): Promise<void> {
-  if (watcher) return;
-  if (!vscode.workspace.getConfiguration("aidrift").get<boolean>("watchClaudeCode", true)) return;
-  watcher = new ClaudeCodeWatcher(async (entry) => {
-    await sessionManager.handleEntry(entry);
-  });
-  try {
-    await watcher.start();
-    console.log("[aidrift] Claude Code watcher started");
-  } catch (err) {
-    console.error("[aidrift] watcher failed to start:", err);
-    watcher = undefined;
+async function startWatchers(): Promise<void> {
+  const cfg = vscode.workspace.getConfiguration("aidrift");
+  if (!claudeWatcher && cfg.get<boolean>("watchClaudeCode", true)) {
+    claudeWatcher = new ClaudeCodeWatcher((entry) => sessionManager.handleEntry(entry, "claude-code"));
+    try {
+      await claudeWatcher.start();
+      console.log("[aidrift] Claude Code watcher started");
+    } catch (err) {
+      console.error("[aidrift] claude watcher failed:", err);
+      claudeWatcher = undefined;
+    }
+  }
+  if (!codexWatcher && cfg.get<boolean>("watchCodex", true)) {
+    codexWatcher = new CodexWatcher((entry) => sessionManager.handleEntry(entry, "codex"));
+    try {
+      await codexWatcher.start();
+      console.log("[aidrift] Codex watcher started");
+    } catch (err) {
+      console.error("[aidrift] codex watcher failed:", err);
+      codexWatcher = undefined;
+    }
   }
 }
 
-async function stopWatcher(): Promise<void> {
-  await watcher?.stop();
-  watcher = undefined;
+async function stopWatchers(): Promise<void> {
+  await claudeWatcher?.stop();
+  claudeWatcher = undefined;
+  await codexWatcher?.stop();
+  codexWatcher = undefined;
 }
 
 // ---------- commands ----------
@@ -97,7 +110,7 @@ async function loginFlow(): Promise<void> {
   try {
     const user = await apiClient.login(email, password);
     void vscode.window.showInformationMessage(`Signed in to AI Drift as ${user.email}`);
-    await startWatcher();
+    await startWatchers();
   } catch (err) {
     const msg = err instanceof ApiError
       ? `Sign-in failed: ${err.message}`
@@ -108,7 +121,7 @@ async function loginFlow(): Promise<void> {
 
 async function logoutFlow(): Promise<void> {
   await apiClient.logout();
-  await stopWatcher();
+  await stopWatchers();
   void vscode.window.showInformationMessage("Signed out of AI Drift");
 }
 
@@ -208,5 +221,5 @@ function openSessionInDashboard(sessionId?: string): void {
 export async function deactivate(): Promise<void> {
   statusBar?.dispose();
   poller?.stop();
-  await stopWatcher();
+  await stopWatchers();
 }

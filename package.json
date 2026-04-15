@@ -9,8 +9,13 @@
     "vscode": "^1.85.0"
   },
   "categories": ["Other"],
+  "license": "MIT",
   "activationEvents": ["onStartupFinished"],
   "main": "./dist/extension.js",
+  "files": [
+    "dist/",
+    "README.md"
+  ],
   "contributes": {
     "commands": [
       { "command": "aidrift.login", "title": "Drift: Sign In" },
@@ -68,6 +73,11 @@
           "default": true,
           "description": "Watch ~/.claude/projects/ for new Claude Code transcripts and auto-track them."
         },
+        "aidrift.watchCodex": {
+          "type": "boolean",
+          "default": true,
+          "description": "Watch ~/.codex/sessions/ for new OpenAI Codex rollouts and auto-track them."
+        },
         "aidrift.statusPollIntervalSeconds": {
           "type": "number",
           "default": 3,
@@ -98,8 +108,10 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node20 --minify",
+    "package": "pnpm bundle && vsce package --no-dependencies --out aidrift-vscode.vsix",
     "watch": "tsc -p tsconfig.json --watch",
-    "clean": "rm -rf dist",
+    "clean": "rm -rf dist *.vsix",
     "test": "echo 'no extension tests yet'"
   },
   "dependencies": {
@@ -109,6 +121,8 @@
   "devDependencies": {
     "@types/node": "^22.9.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.2.1",
+    "esbuild": "^0.24.0",
     "typescript": "^5.6.3"
   }
 }

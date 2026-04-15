@@ -68,7 +68,7 @@ export class SessionManager {
     return this.activeTaskDescription;
   }
 
-  private async ensureSession(sessionHint: string, suggestedTask: string): Promise<string> {
+  private async ensureSession(sessionHint: string, suggestedTask: string, provider: "claude-code" | "codex"): Promise<string> {
     const cached = this.sessionBySH.get(sessionHint);
     if (cached) return cached;
     try {
@@ -80,12 +80,12 @@ export class SessionManager {
       const e = err as { status?: number };
       if (e.status !== 404) throw err;
     }
-    const task = suggestedTask.slice(0, 200) || "Claude Code session";
+    const task = suggestedTask.slice(0, 200) || `${provider} session`;
     const created = await this.api.request<SessionDto>("/sessions", {
       method: "POST",
       body: JSON.stringify({
         taskDescription: task,
-        provider: "claude-code",
+        provider,
         sessionHint,
         autoCheckpointEnabled: true,
       }),
@@ -95,12 +95,12 @@ export class SessionManager {
     return created.id;
   }
 
-  async handleEntry(entry: ParsedEntry): Promise<void> {
+  async handleEntry(entry: ParsedEntry, provider: "claude-code" | "codex" = "claude-code"): Promise<void> {
     if (entry.kind === "skip") return;
 
     if (entry.kind === "user-prompt") {
       // 1. Flush the previous user/assistant pair (if any) — this lands the turn.
-      await this.flushPending(entry.sessionHint);
+      await this.flushPending(entry.sessionHint, provider);
 
       // 2. Implicit-reject check against the last-posted turn in THIS session.
       await this.maybeImplicitReject(entry.sessionHint, entry.text);
@@ -143,11 +143,11 @@ export class SessionManager {
     }
   }
 
-  private async flushPending(sessionHint: string): Promise<void> {
+  private async flushPending(sessionHint: string, provider: "claude-code" | "codex"): Promise<void> {
     const p = this.pending.get(sessionHint);
     if (!p) return;
     if (p.assistantChunks.length === 0) return;
-    const sessionId = await this.ensureSession(sessionHint, p.userPromptText);
+    const sessionId = await this.ensureSession(sessionHint, p.userPromptText, provider);
     try {
       const turn = await this.api.request<{ id: string }>(`/sessions/${sessionId}/turns`, {
         method: "POST",
@@ -155,7 +155,7 @@ export class SessionManager {
           userPrompt: p.userPromptText,
           modelResponse: p.assistantChunks.join("\n\n"),
           metadata: {
-            source: "claude-code-jsonl",
+            source: `${provider}-jsonl`,
             userPromptUuid: p.userPromptUuid,
             model: p.model,
           },
