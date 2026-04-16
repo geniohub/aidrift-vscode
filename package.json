@@ -2,7 +2,7 @@
   "name": "aidrift",
   "displayName": "AI Drift Detector",
   "description": "Watches your AI coding chats (Claude Code, Codex) and warns when sessions drift.",
-  "version": "0.0.2",
+  "version": "0.0.10",
   "publisher": "aidrift",
   "private": false,
   "engines": {
@@ -88,7 +88,7 @@
         },
         "aidrift.statusPollIntervalSeconds": {
           "type": "number",
-          "default": 3,
+          "default": 30,
           "description": "How often the status bar polls /sessions/:id/status."
         },
         "aidrift.driftAlertThreshold": {
@@ -112,7 +112,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node20 --minify",
-    "package": "pnpm bundle && vsce package --no-dependencies --out aidrift-0.0.2.vsix",
+    "package": "pnpm bundle && vsce package --no-dependencies",
     "watch": "tsc -p tsconfig.json --watch",
     "clean": "rm -rf dist *.vsix",
     "test": "echo 'no extension tests yet'"

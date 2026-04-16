@@ -29,7 +29,13 @@ export interface ParsedAssistantReply {
   toolCalls: string[];
 }
 
-export type ParsedEntry = ParsedUserPrompt | ParsedAssistantReply | { kind: "skip" };
+export interface ParsedAiTitle {
+  kind: "ai-title";
+  sessionHint: string;
+  title: string;
+}
+
+export type ParsedEntry = ParsedUserPrompt | ParsedAssistantReply | ParsedAiTitle | { kind: "skip" };
 
 interface ContentBlock {
   type: string;
@@ -55,15 +61,23 @@ interface RawEntry {
   userType?: string;
 }
 
+const CONTEXT_TAG_RE = /<(?:ide_[a-z_]+|system-reminder|environment_context|context|status|instructions)>[\s\S]*?<\/(?:ide_[a-z_]+|system-reminder|environment_context|context|status|instructions)>/gi;
+
+export function stripIdeTags(text: string): string {
+  return text.replace(CONTEXT_TAG_RE, "").trim();
+}
+
 function extractTextBlocks(content: string | ContentBlock[] | undefined, keep: string[]): string {
   if (!content) return "";
-  if (typeof content === "string") return content;
+  if (typeof content === "string") return stripIdeTags(content);
   if (!Array.isArray(content)) return "";
   const parts: string[] = [];
   for (const block of content) {
     if (!keep.includes(block.type)) continue;
-    if (block.type === "text" && block.text) parts.push(block.text);
-    else if (block.type === "thinking" && block.thinking) parts.push(block.thinking);
+    if (block.type === "text" && block.text) {
+      const cleaned = stripIdeTags(block.text);
+      if (cleaned) parts.push(cleaned);
+    } else if (block.type === "thinking" && block.thinking) parts.push(block.thinking);
   }
   return parts.join("\n\n");
 }
@@ -123,7 +137,36 @@ export function parseLine(line: string): ParsedEntry {
     return { kind: "skip" };
   }
 
+  if (raw.type === "ai-title" && raw.sessionId) {
+    const title = (raw as unknown as Record<string, unknown>).aiTitle;
+    if (typeof title === "string" && title.trim()) {
+      return { kind: "ai-title", sessionHint: raw.sessionId, title: title.trim() };
+    }
+    return { kind: "skip" };
+  }
+
   if (!raw.sessionId || !raw.uuid || !raw.timestamp) return { kind: "skip" };
+
+  // Queued commands: messages sent by the user while the assistant is working.
+  // Claude Code stores these as type:"attachment" with attachment.type:"queued_command".
+  if (raw.type === "attachment") {
+    const att = (raw as unknown as Record<string, unknown>).attachment as
+      | { type?: string; prompt?: ContentBlock[] }
+      | undefined;
+    if (att?.type === "queued_command" && Array.isArray(att.prompt)) {
+      const text = extractTextBlocks(att.prompt, ["text"]);
+      if (text) {
+        return {
+          kind: "user-prompt",
+          uuid: raw.uuid,
+          sessionHint: raw.sessionId,
+          text,
+          timestamp: raw.timestamp,
+        };
+      }
+    }
+    return { kind: "skip" };
+  }
 
   if (raw.type === "user") {
     // "user" entries include real prompts AND tool_result injections.

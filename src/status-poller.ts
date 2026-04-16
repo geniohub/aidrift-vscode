@@ -3,7 +3,7 @@
 // first transitions to active.
 
 import * as vscode from "vscode";
-import type { ApiClient } from "./api-client";
+import { ApiError, type ApiClient } from "./api-client";
 
 interface StatusDto {
   session: { id: string; taskDescription: string };
@@ -28,6 +28,18 @@ interface TrackingHealthDto {
   recommendations: string[];
 }
 
+function formatIdleLabel(lastTurnAt: string | null): string {
+  if (!lastTurnAt) return "no turns yet";
+  const deltaMs = Date.now() - new Date(lastTurnAt).getTime();
+  if (deltaMs < 0) return "";
+  const min = Math.floor(deltaMs / 60_000);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  return `${day}d ago`;
+}
+
 export class StatusPoller {
   private timer: NodeJS.Timeout | undefined;
   private lastAlertActive = false;
@@ -40,6 +52,7 @@ export class StatusPoller {
     private readonly getActiveSessionId: () => string | null,
     private readonly getActiveTaskDescription: () => string | null,
     private readonly getWorkspacePath: () => string | undefined,
+    private readonly onStaleActiveSession: () => void = () => {},
   ) {}
 
   start(): void {
@@ -64,8 +77,8 @@ export class StatusPoller {
   private scheduleNext(): void {
     const intervalSec = vscode.workspace
       .getConfiguration("aidrift")
-      .get<number>("statusPollIntervalSeconds", 3);
-    this.timer = setTimeout(() => void this.tick(), Math.max(1, intervalSec) * 1000);
+      .get<number>("statusPollIntervalSeconds", 30);
+    this.timer = setTimeout(() => void this.tick(), Math.max(5, intervalSec) * 1000);
   }
 
   private async tick(): Promise<void> {
@@ -80,14 +93,14 @@ export class StatusPoller {
           this.statusBar.backgroundColor = undefined;
         } else {
           const tracking = await this.fetchTrackingHealth();
-          const trackingBadge = tracking?.hasRecentActivity ? "$(pass)" : "$(warning)";
-          const trackingLabel = tracking?.hasRecentActivity ? "tracking ok" : "tracking stale";
-          this.statusBar.text = task
-            ? `${trackingBadge} Drift — ${trackingLabel}`
-            : `${trackingBadge} Drift: watching · ${trackingLabel}`;
+          const recent = tracking?.hasRecentActivity ?? false;
+          const idleLabel = formatIdleLabel(tracking?.lastTurnAt ?? null);
+          this.statusBar.text = recent
+            ? "$(pulse) Drift: watching"
+            : `$(warning) Drift: idle${idleLabel ? ` · ${idleLabel}` : ""}`;
           this.statusBar.command = "aidrift.openActiveInDashboard";
           this.statusBar.tooltip = this.trackingTooltip(tracking);
-          this.statusBar.backgroundColor = tracking?.hasRecentActivity
+          this.statusBar.backgroundColor = recent
             ? undefined
             : new vscode.ThemeColor("statusBarItem.warningBackground");
         }
@@ -100,9 +113,24 @@ export class StatusPoller {
       this.render(status, tracking);
       this.maybeNotify(status);
     } catch (err) {
-      this.statusBar.text = "$(warning) Drift: api?";
-      this.statusBar.tooltip = `AI Drift API unreachable: ${(err as Error).message}`;
-      this.statusBar.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
+      // 404 = stale active session id (e.g. it was deleted). Just clear the
+      // status; don't pretend the API is down.
+      if (err instanceof ApiError && err.status === 404) {
+        this.onStaleActiveSession();
+        this.lastStatus = null;
+        this.statusBar.text = "$(pulse) Drift: watching";
+        this.statusBar.tooltip = "Active session no longer exists.";
+        this.statusBar.backgroundColor = undefined;
+      } else if (err instanceof ApiError && err.status === 401) {
+        this.statusBar.text = "$(account) Drift: sign in";
+        this.statusBar.command = "aidrift.login";
+        this.statusBar.tooltip = "AI Drift session expired — sign in again.";
+        this.statusBar.backgroundColor = undefined;
+      } else {
+        this.statusBar.text = "$(warning) Drift: api?";
+        this.statusBar.tooltip = `AI Drift API unreachable: ${(err as Error).message}`;
+        this.statusBar.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
+      }
     } finally {
       this.scheduleNext();
     }

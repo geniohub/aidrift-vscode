@@ -83,6 +83,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     () => sessionManager.getActiveSessionId(),
     () => sessionManager.getActiveTaskDescription(),
     () => firstWorkspaceRoot(),
+    () => sessionManager.clearActiveSession(),
   );
   poller.start();
   context.subscriptions.push({ dispose: () => poller?.stop() });
@@ -135,7 +136,7 @@ async function startWatchers(): Promise<void> {
   }
   if (!codexWatcher && cfg.get<boolean>("watchCodex", true)) {
     codexWatcher = new CodexWatcher((entry) => {
-      const workspacePath = entry.kind === "skip" ? undefined : entry.workspacePath;
+      const workspacePath = (entry.kind === "skip" || entry.kind === "ai-title") ? undefined : entry.workspacePath;
       if (!isInActiveWorkspace(workspacePath)) return Promise.resolve();
       return sessionManager.handleEntry(entry, "codex", workspacePath);
     });

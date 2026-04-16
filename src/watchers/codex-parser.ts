@@ -40,11 +40,18 @@ interface CodexParserState {
   workspacePath: string | null;
 }
 
+const CONTEXT_TAG_RE = /<(?:environment_context|context|status|instructions|system-reminder|ide_[a-z_]+)>[\s\S]*?<\/(?:environment_context|context|status|instructions|system-reminder|ide_[a-z_]+)>/gi;
+
+function stripContextTags(text: string): string {
+  return text.replace(CONTEXT_TAG_RE, "").trim();
+}
+
 function extractText(content: ContentBlock[] | undefined, keepTypes: string[]): string {
   if (!Array.isArray(content)) return "";
   return content
     .filter((b) => keepTypes.includes(b.type) && typeof b.text === "string")
-    .map((b) => b.text as string)
+    .map((b) => stripContextTags(b.text as string))
+    .filter(Boolean)
     .join("\n\n");
 }
 

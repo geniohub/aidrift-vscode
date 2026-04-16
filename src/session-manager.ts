@@ -96,6 +96,21 @@ export class SessionManager {
     return this.activeTaskDescription;
   }
 
+  /** Clears the cached active session id (e.g. after the API returns 404 for it). */
+  clearActiveSession(): void {
+    const stale = this.activeSessionId;
+    this.activeSessionId = null;
+    this.activeTaskDescription = null;
+    // Drop any sessionHint→id mappings that point at the now-stale id so
+    // the next entry triggers a fresh ensureSession lookup.
+    if (stale) {
+      for (const [hint, sid] of this.sessionBySH.entries()) {
+        if (sid === stale) this.sessionBySH.delete(hint);
+      }
+      this.lastTurn.delete(stale);
+    }
+  }
+
   private cacheSession(session: SessionDto): string {
     if (session.sessionHint) this.sessionBySH.set(session.sessionHint, session.id);
     this.activeTaskDescription = session.taskDescription;
@@ -118,8 +133,9 @@ export class SessionManager {
     suggestedTask: string,
     provider: "claude-code" | "codex",
     workspacePath?: string,
-  ): Promise<string> {
+  ): Promise<string | null> {
     const cached = this.sessionBySH.get(sessionHint);
+    if (cached === "__skip__") return null;
     if (cached) return cached;
     const existing = await this.findSessionByHint(sessionHint, workspacePath);
     if (existing) return this.cacheSession(existing);
@@ -138,6 +154,12 @@ export class SessionManager {
       });
       return this.cacheSession(created);
     } catch (createErr) {
+      const e = createErr as { status?: number };
+      // 409 = sessionHint already belongs to another user — skip silently.
+      if (e.status === 409) {
+        this.sessionBySH.set(sessionHint, "__skip__");
+        return null;
+      }
       // A concurrent create (or prior collision resolved server-side) can make
       // the insert fail; re-read once by hint before surfacing the error.
       const raced = await this.findSessionByHint(sessionHint, workspacePath);
@@ -152,6 +174,22 @@ export class SessionManager {
     workspacePath?: string,
   ): Promise<void> {
     if (entry.kind === "skip") return;
+
+    if (entry.kind === "ai-title") {
+      const sid = this.sessionBySH.get(entry.sessionHint);
+      if (sid) {
+        try {
+          await this.api.request(`/sessions/${sid}`, {
+            method: "PATCH",
+            body: JSON.stringify({ taskDescription: entry.title }),
+          });
+        } catch {
+          // Session title update is best-effort.
+        }
+      }
+      return;
+    }
+
     const effectiveWorkspacePath = workspacePath ?? entry.workspacePath;
 
     if (entry.kind === "user-prompt") {
@@ -164,6 +202,7 @@ export class SessionManager {
           provider,
           effectiveWorkspacePath,
         );
+        if (!sid) return; // belongs to another user
         this.activeSessionId = sid;
       } catch (err) {
         console.error("[aidrift] ensureSession bootstrap failed:", err);
@@ -245,6 +284,7 @@ export class SessionManager {
       p.provider,
       p.workspacePath,
     );
+    if (!sessionId) return; // belongs to another user
     try {
       const turn = await this.api.request<{ id: string }>(`/sessions/${sessionId}/turns`, {
         method: "POST",
