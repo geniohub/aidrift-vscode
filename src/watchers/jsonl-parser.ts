@@ -8,6 +8,7 @@ export interface ParsedUserPrompt {
   sessionHint: string;
   text: string;
   timestamp: string;
+  workspacePath?: string;
 }
 
 export interface ParsedAssistantReply {
@@ -18,6 +19,14 @@ export interface ParsedAssistantReply {
   timestamp: string;
   model?: string;
   parentUuid?: string;
+  workspacePath?: string;
+  /**
+   * Tool-call fingerprints extracted from this assistant message, one per
+   * tool_use block. Format: `"<tool>:<key>"` — e.g. `"read:/abs/path.ts"`,
+   * `"bash:npm test"`. Used by the scoring engine to detect churn (same
+   * action repeated across turns).
+   */
+  toolCalls: string[];
 }
 
 export type ParsedEntry = ParsedUserPrompt | ParsedAssistantReply | { kind: "skip" };
@@ -26,6 +35,8 @@ interface ContentBlock {
   type: string;
   text?: string;
   thinking?: string;
+  name?: string;
+  input?: Record<string, unknown>;
 }
 
 interface Message {
@@ -57,6 +68,52 @@ function extractTextBlocks(content: string | ContentBlock[] | undefined, keep: s
   return parts.join("\n\n");
 }
 
+/**
+ * Normalize a tool_use block into a short `tool:key` fingerprint. Returns
+ * null when the block isn't a tool_use, the tool is unknown, or the key
+ * argument is missing. The goal is stability across retries, so we lowercase
+ * and collapse whitespace on free-text keys (bash command, grep pattern).
+ */
+export function fingerprintToolUse(block: ContentBlock): string | null {
+  if (block.type !== "tool_use") return null;
+  const name = block.name?.toLowerCase();
+  const input = block.input ?? {};
+  if (!name) return null;
+
+  const path = typeof input.file_path === "string" ? input.file_path : null;
+  const pattern = typeof input.pattern === "string" ? input.pattern : null;
+  const command = typeof input.command === "string" ? input.command : null;
+
+  const norm = (s: string): string => s.toLowerCase().replace(/\s+/g, " ").trim().slice(0, 80);
+
+  switch (name) {
+    case "read":
+    case "write":
+    case "edit":
+    case "multiedit":
+    case "notebookedit":
+      return path ? `${name}:${path}` : null;
+    case "bash":
+      return command ? `bash:${norm(command)}` : null;
+    case "grep":
+      return pattern ? `grep:${norm(pattern)}` : null;
+    case "glob":
+      return pattern ? `glob:${norm(pattern)}` : null;
+    default:
+      return null;
+  }
+}
+
+export function extractToolCalls(content: string | ContentBlock[] | undefined): string[] {
+  if (!content || typeof content === "string" || !Array.isArray(content)) return [];
+  const out: string[] = [];
+  for (const block of content) {
+    const fp = fingerprintToolUse(block);
+    if (fp) out.push(fp);
+  }
+  return out;
+}
+
 export function parseLine(line: string): ParsedEntry {
   if (!line.trim()) return { kind: "skip" };
   let raw: RawEntry;
@@ -83,10 +140,12 @@ export function parseLine(line: string): ParsedEntry {
   }
 
   if (raw.type === "assistant") {
-    // Keep only `text` blocks — drop thinking (internal) and tool_use (noisy).
-    // In v2 we may want to include tool_use summaries for richer scoring.
+    // Keep text blocks for scoring text; tool_use blocks get fingerprinted
+    // separately so we can detect action-level churn (edit-revert, re-read,
+    // bash-retry) that a pure-text similarity check can't see.
     const text = extractTextBlocks(raw.message?.content, ["text"]);
-    if (!text) return { kind: "skip" };
+    const toolCalls = extractToolCalls(raw.message?.content);
+    if (!text && toolCalls.length === 0) return { kind: "skip" };
     return {
       kind: "assistant-reply",
       uuid: raw.uuid,
@@ -95,6 +154,7 @@ export function parseLine(line: string): ParsedEntry {
       timestamp: raw.timestamp,
       model: raw.message?.model,
       parentUuid: raw.parentUuid,
+      toolCalls,
     };
   }
 

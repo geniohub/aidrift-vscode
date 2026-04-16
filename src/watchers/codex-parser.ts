@@ -24,6 +24,7 @@ interface MessagePayload {
 
 interface SessionMetaPayload {
   id: string;
+  cwd?: string;
 }
 
 interface RawLine {
@@ -35,6 +36,8 @@ interface RawLine {
 interface CodexParserState {
   /** sessionHint resolved from the file's first session_meta line, or from the filename. */
   sessionHint: string | null;
+  /** Project cwd from session_meta; used for workspace scoping. */
+  workspacePath: string | null;
 }
 
 function extractText(content: ContentBlock[] | undefined, keepTypes: string[]): string {
@@ -57,7 +60,7 @@ export function sessionHintFromFilename(path: string): string | null {
 }
 
 export function createCodexParser(initialHint: string | null): (line: string) => ParsedEntry {
-  const state: CodexParserState = { sessionHint: initialHint };
+  const state: CodexParserState = { sessionHint: initialHint, workspacePath: null };
   let syntheticCounter = 0;
 
   return (line: string): ParsedEntry => {
@@ -73,6 +76,7 @@ export function createCodexParser(initialHint: string | null): (line: string) =>
     if (raw.type === "session_meta" && raw.payload) {
       const meta = raw.payload as SessionMetaPayload;
       if (meta.id) state.sessionHint = meta.id;
+      if (meta.cwd) state.workspacePath = meta.cwd;
       return { kind: "skip" };
     }
 
@@ -95,6 +99,7 @@ export function createCodexParser(initialHint: string | null): (line: string) =>
         sessionHint,
         text,
         timestamp: ts,
+        workspacePath: state.workspacePath ?? undefined,
       };
     }
 
@@ -108,6 +113,8 @@ export function createCodexParser(initialHint: string | null): (line: string) =>
         sessionHint,
         text,
         timestamp: ts,
+        workspacePath: state.workspacePath ?? undefined,
+        toolCalls: [],
       };
     }
 

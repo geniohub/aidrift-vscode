@@ -9,6 +9,7 @@ VSCode extension that watches your Claude Code and OpenAI Codex chats and warns 
 - Live status bar showing score (0–100) and trend (↗ / → / ↘)
 - Notification with actions when drift is detected
 - Sidebar list of recent sessions
+- Status bar includes tracking health badge (`tracking ok` / `tracking stale`) based on `/tracking/health`
 
 ## Setup
 
@@ -18,6 +19,7 @@ Requires an AI Drift backend running. For local dev: clone the repo, `docker com
 
 - `Drift: Sign In` / `Drift: Sign Out` / `Drift: Show Signed-In User`
 - `Drift: Show Status for Active Session`
+- `Drift: Debug Tracking` (prints watcher/user/workspace + `/tracking/health` diagnostics)
 - `Drift: Open Active Session in Dashboard`
 - `Drift: Mark Last Turn Accepted` / `Drift: Mark Last Turn Rejected`
 - `Drift: Create Checkpoint for Active Session`

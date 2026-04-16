@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { normalize } from "node:path";
 import { VERSION } from "@aidrift/core";
 import { ApiClient, ApiError } from "./api-client";
 import { ClaudeCodeWatcher } from "./watchers/claude-code-watcher";
@@ -14,6 +15,56 @@ let claudeWatcher: ClaudeCodeWatcher | undefined;
 let codexWatcher: CodexWatcher | undefined;
 let poller: StatusPoller | undefined;
 let treeProvider: SessionsTreeProvider | undefined;
+
+function normalizeWorkspacePath(p: string): string {
+  return normalize(p).replace(/[\\\/]+$/, "");
+}
+
+function workspaceRoots(): string[] {
+  return (vscode.workspace.workspaceFolders ?? [])
+    .map((f) => normalizeWorkspacePath(f.uri.fsPath))
+    .filter(Boolean);
+}
+
+function claudeProjectSlugFromWorkspacePath(workspacePath: string): string {
+  return normalizeWorkspacePath(workspacePath).replace(/\\/g, "/").replace(/\//g, "-");
+}
+
+function firstWorkspaceRoot(): string | undefined {
+  return workspaceRoots()[0];
+}
+
+function isSameOrChildPath(candidate: string, root: string): boolean {
+  const c = normalizeWorkspacePath(candidate);
+  const r = normalizeWorkspacePath(root);
+  return c === r || c.startsWith(`${r}/`) || c.startsWith(`${r}\\`);
+}
+
+function isInActiveWorkspace(candidatePath: string | undefined): boolean {
+  const roots = workspaceRoots();
+  if (roots.length === 0) return true;
+  if (!candidatePath) return false;
+  return roots.some((root) => isSameOrChildPath(candidatePath, root));
+}
+
+function claudeProjectSlugFromFile(filePath: string): string | undefined {
+  const normalized = filePath.replace(/\\/g, "/");
+  const marker = "/.claude/projects/";
+  const idx = normalized.indexOf(marker);
+  if (idx === -1) return undefined;
+  const rest = normalized.slice(idx + marker.length);
+  const slug = rest.split("/")[0];
+  if (!slug) return undefined;
+  return slug;
+}
+
+function claudeWorkspaceRootForFile(filePath: string): string | null | undefined {
+  const roots = workspaceRoots();
+  if (roots.length === 0) return null;
+  const slug = claudeProjectSlugFromFile(filePath);
+  if (!slug) return undefined;
+  return roots.find((root) => claudeProjectSlugFromWorkspacePath(root) === slug);
+}
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   console.log(`[aidrift] activating v${VERSION}`);
@@ -31,6 +82,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     statusBar,
     () => sessionManager.getActiveSessionId(),
     () => sessionManager.getActiveTaskDescription(),
+    () => firstWorkspaceRoot(),
   );
   poller.start();
   context.subscriptions.push({ dispose: () => poller?.stop() });
@@ -43,13 +95,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push({ dispose: () => treeProvider?.stopAutoRefresh() });
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("aidrift.login", () => loginFlow()),
+    vscode.commands.registerCommand("aidrift.login", () => loginChooser()),
+    vscode.commands.registerCommand("aidrift.loginWithToken", () => loginWithTokenFlow()),
+    vscode.commands.registerCommand("aidrift.loginWithPassword", () => loginFlow()),
     vscode.commands.registerCommand("aidrift.logout", () => logoutFlow()),
     vscode.commands.registerCommand("aidrift.whoami", () => whoamiFlow()),
     vscode.commands.registerCommand("aidrift.acceptLastTurn", () => setLastTurnOutcome("accepted")),
     vscode.commands.registerCommand("aidrift.rejectLastTurn", () => setLastTurnOutcome("rejected")),
     vscode.commands.registerCommand("aidrift.createCheckpoint", () => createCheckpointFlow()),
+    vscode.commands.registerCommand("aidrift.revertToLastCheckpoint", () => revertToLastCheckpoint()),
     vscode.commands.registerCommand("aidrift.showStatus", () => showStatusFlow()),
+    vscode.commands.registerCommand("aidrift.debugTracking", () => debugTrackingFlow()),
     vscode.commands.registerCommand("aidrift.openActiveInDashboard", () => openActiveInDashboard()),
     vscode.commands.registerCommand("aidrift.openSessionInDashboard", (sessionId?: string) => openSessionInDashboard(sessionId)),
     vscode.commands.registerCommand("aidrift.refreshSessions", () => treeProvider?.refresh()),
@@ -64,7 +120,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 async function startWatchers(): Promise<void> {
   const cfg = vscode.workspace.getConfiguration("aidrift");
   if (!claudeWatcher && cfg.get<boolean>("watchClaudeCode", true)) {
-    claudeWatcher = new ClaudeCodeWatcher((entry) => sessionManager.handleEntry(entry, "claude-code"));
+    claudeWatcher = new ClaudeCodeWatcher((entry, filePath) => {
+      const workspacePath = claudeWorkspaceRootForFile(filePath);
+      if (workspacePath === undefined) return Promise.resolve();
+      return sessionManager.handleEntry(entry, "claude-code", workspacePath ?? undefined);
+    });
     try {
       await claudeWatcher.start();
       console.log("[aidrift] Claude Code watcher started");
@@ -74,7 +134,11 @@ async function startWatchers(): Promise<void> {
     }
   }
   if (!codexWatcher && cfg.get<boolean>("watchCodex", true)) {
-    codexWatcher = new CodexWatcher((entry) => sessionManager.handleEntry(entry, "codex"));
+    codexWatcher = new CodexWatcher((entry) => {
+      const workspacePath = entry.kind === "skip" ? undefined : entry.workspacePath;
+      if (!isInActiveWorkspace(workspacePath)) return Promise.resolve();
+      return sessionManager.handleEntry(entry, "codex", workspacePath);
+    });
     try {
       await codexWatcher.start();
       console.log("[aidrift] Codex watcher started");
@@ -95,6 +159,7 @@ async function stopWatchers(): Promise<void> {
 // ---------- commands ----------
 
 async function loginFlow(): Promise<void> {
+  const previousEmail = await apiClient.getEmail();
   const email = await vscode.window.showInputBox({
     prompt: "Email",
     placeHolder: "you@example.com",
@@ -109,6 +174,10 @@ async function loginFlow(): Promise<void> {
   if (!password) return;
   try {
     const user = await apiClient.login(email, password);
+    if (previousEmail && previousEmail !== user.email) {
+      await stopWatchers();
+    }
+    sessionManager.reset();
     void vscode.window.showInformationMessage(`Signed in to AI Drift as ${user.email}`);
     await startWatchers();
   } catch (err) {
@@ -119,9 +188,48 @@ async function loginFlow(): Promise<void> {
   }
 }
 
+async function loginChooser(): Promise<void> {
+  const pick = await vscode.window.showQuickPick(
+    [
+      { label: "Sign in with token", description: "Paste a Personal Access Token from the dashboard (works with Google accounts)", value: "token" },
+      { label: "Sign in with email + password", description: "Only works if you registered with a password", value: "password" },
+    ],
+    { placeHolder: "How do you want to sign in to AI Drift?", ignoreFocusOut: true },
+  );
+  if (!pick) return;
+  if (pick.value === "token") await loginWithTokenFlow();
+  else await loginFlow();
+}
+
+async function loginWithTokenFlow(): Promise<void> {
+  const previousEmail = await apiClient.getEmail();
+  const token = await vscode.window.showInputBox({
+    prompt: "Paste your AI Drift Personal Access Token",
+    placeHolder: "aidrift_pat_…",
+    password: true,
+    ignoreFocusOut: true,
+  });
+  if (!token) return;
+  try {
+    const user = await apiClient.loginWithToken(token.trim());
+    if (previousEmail && previousEmail !== user.email) {
+      await stopWatchers();
+    }
+    sessionManager.reset();
+    void vscode.window.showInformationMessage(`Signed in to AI Drift as ${user.email}`);
+    await startWatchers();
+  } catch (err) {
+    const msg = err instanceof ApiError
+      ? `Token sign-in failed: ${err.message}`
+      : `Token sign-in failed: ${(err as Error).message}`;
+    void vscode.window.showErrorMessage(msg);
+  }
+}
+
 async function logoutFlow(): Promise<void> {
   await apiClient.logout();
   await stopWatchers();
+  sessionManager.reset();
   void vscode.window.showInformationMessage("Signed out of AI Drift");
 }
 
@@ -208,14 +316,83 @@ function showStatusFlow(): void {
   );
 }
 
+async function debugTrackingFlow(): Promise<void> {
+  const workspacePath = firstWorkspaceRoot();
+  const watchClaude = vscode.workspace.getConfiguration("aidrift").get<boolean>("watchClaudeCode", true);
+  const watchCodex = vscode.workspace.getConfiguration("aidrift").get<boolean>("watchCodex", true);
+  const email = await apiClient.getEmail();
+
+  const lines: string[] = [];
+  lines.push(`signed in: ${email ?? "no"}`);
+  lines.push(`workspace: ${workspacePath ?? "(none)"}`);
+  lines.push(`active session: ${sessionManager.getActiveSessionId() ?? "(none)"}`);
+  lines.push(`watchClaudeCode: ${watchClaude} (${claudeWatcher ? "running" : "stopped"})`);
+  lines.push(`watchCodex: ${watchCodex} (${codexWatcher ? "running" : "stopped"})`);
+
+  try {
+    const query = workspacePath ? `?workspacePath=${encodeURIComponent(workspacePath)}` : "";
+    const tracking = await apiClient.request<{
+      hasRecentActivity: boolean;
+      sessionsTotal: number;
+      sessionsOpen: number;
+      turnsLast24h: number;
+      lastTurnAt: string | null;
+      sourceBreakdown: Array<{ source: string; count: number }>;
+      recommendations: string[];
+    }>(`/tracking/health${query}`);
+    lines.push(`recent activity: ${tracking.hasRecentActivity}`);
+    lines.push(`sessions: total=${tracking.sessionsTotal}, open=${tracking.sessionsOpen}`);
+    lines.push(`turns (24h): ${tracking.turnsLast24h}`);
+    lines.push(`last turn: ${tracking.lastTurnAt ?? "(none)"}`);
+    const src = tracking.sourceBreakdown
+      .slice(0, 5)
+      .map((s) => `${s.source}:${s.count}`)
+      .join(", ");
+    lines.push(`sources: ${src || "(none)"}`);
+    if (tracking.recommendations.length > 0) {
+      lines.push("recommendations:");
+      for (const r of tracking.recommendations) lines.push(`- ${r}`);
+    }
+  } catch (err) {
+    lines.push(`tracking api error: ${(err as Error).message}`);
+  }
+
+  void vscode.window.showInformationMessage("AI Drift tracking diagnostics copied to output.");
+  const channel = vscode.window.createOutputChannel("AI Drift Tracking");
+  channel.clear();
+  channel.appendLine(lines.join("\n"));
+  channel.show(true);
+}
+
 function openActiveInDashboard(): void {
   openSessionInDashboard(sessionManager.getActiveSessionId() ?? undefined);
 }
 
-function openSessionInDashboard(sessionId?: string): void {
+function openSessionInDashboard(sessionId?: string, hash?: string): void {
   const base = vscode.workspace.getConfiguration("aidrift").get<string>("dashboardUrl") ?? "http://localhost:3331";
-  const url = sessionId ? `${base}/sessions/${sessionId}` : `${base}/sessions`;
+  const workspacePath = firstWorkspaceRoot();
+  const query = workspacePath ? `?workspacePath=${encodeURIComponent(workspacePath)}` : "";
+  const fragment = hash ? `#${hash.replace(/^#/, "")}` : "";
+  const url = sessionId
+    ? `${base}/sessions/${sessionId}${query}${fragment}`
+    : `${base}/sessions${query}`;
   void vscode.env.openExternal(vscode.Uri.parse(url));
+}
+
+function revertToLastCheckpoint(): void {
+  const status = poller?.getLastStatus();
+  if (!status) {
+    void vscode.window.showInformationMessage("No drift status yet.");
+    return;
+  }
+  const cp = status.lastStableCheckpoint;
+  if (!cp) {
+    void vscode.window.showInformationMessage(
+      "No stable checkpoint to revert to yet. Mark an accepted turn as a checkpoint first.",
+    );
+    return;
+  }
+  openSessionInDashboard(status.session.id, `turn-${cp.turnId}`);
 }
 
 export async function deactivate(): Promise<void> {

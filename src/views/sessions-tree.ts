@@ -2,6 +2,7 @@
 // score badge and opens the dashboard detail page on click.
 
 import * as vscode from "vscode";
+import { normalize } from "node:path";
 import type { ApiClient } from "../api-client";
 
 interface SessionDto {
@@ -102,7 +103,10 @@ export class SessionsTreeProvider implements vscode.TreeDataProvider<SessionTree
       return [signIn as unknown as SessionTreeItem];
     }
     try {
-      const sessions = await this.api.request<SessionDto[]>("/sessions?limit=25");
+      const workspacePath = (vscode.workspace.workspaceFolders ?? [])
+        .map((f) => normalize(f.uri.fsPath).replace(/[\\\/]+$/, ""))[0];
+      const query = workspacePath ? `&workspacePath=${encodeURIComponent(workspacePath)}` : "";
+      const sessions = await this.api.request<SessionDto[]>(`/sessions?limit=25${query}`);
       if (sessions.length === 0) {
         const empty = new vscode.TreeItem("No sessions yet. Chat in Claude Code to start.", vscode.TreeItemCollapsibleState.None);
         empty.iconPath = new vscode.ThemeIcon("info");

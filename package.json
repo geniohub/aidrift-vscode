@@ -1,15 +1,19 @@
 {
-  "name": "aidrift-vscode",
+  "name": "aidrift",
   "displayName": "AI Drift Detector",
   "description": "Watches your AI coding chats (Claude Code, Codex) and warns when sessions drift.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "aidrift",
-  "private": true,
+  "private": false,
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": ["Other"],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alper/AiDrift.git"
+  },
   "activationEvents": ["onStartupFinished"],
   "main": "./dist/extension.js",
   "files": [
@@ -19,12 +23,16 @@
   "contributes": {
     "commands": [
       { "command": "aidrift.login", "title": "Drift: Sign In" },
+      { "command": "aidrift.loginWithToken", "title": "Drift: Sign In with Token" },
+      { "command": "aidrift.loginWithPassword", "title": "Drift: Sign In with Email + Password" },
       { "command": "aidrift.logout", "title": "Drift: Sign Out" },
       { "command": "aidrift.whoami", "title": "Drift: Show Signed-In User" },
       { "command": "aidrift.acceptLastTurn", "title": "Drift: Mark Last Turn Accepted" },
       { "command": "aidrift.rejectLastTurn", "title": "Drift: Mark Last Turn Rejected" },
       { "command": "aidrift.createCheckpoint", "title": "Drift: Create Checkpoint for Active Session" },
+      { "command": "aidrift.revertToLastCheckpoint", "title": "Drift: Open Last Stable Checkpoint" },
       { "command": "aidrift.showStatus", "title": "Drift: Show Status for Active Session" },
+      { "command": "aidrift.debugTracking", "title": "Drift: Debug Tracking" },
       { "command": "aidrift.openActiveInDashboard", "title": "Drift: Open Active Session in Dashboard" },
       { "command": "aidrift.openSessionInDashboard", "title": "Drift: Open Session in Dashboard" },
       { "command": "aidrift.refreshSessions", "title": "Drift: Refresh Sessions", "icon": "$(refresh)" }
@@ -83,11 +91,6 @@
           "default": 3,
           "description": "How often the status bar polls /sessions/:id/status."
         },
-        "aidrift.watchCodex": {
-          "type": "boolean",
-          "default": false,
-          "description": "Watch Codex session logs (Phase 7)."
-        },
         "aidrift.driftAlertThreshold": {
           "type": "number",
           "default": 65,
@@ -109,7 +112,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node20 --minify",
-    "package": "pnpm bundle && vsce package --no-dependencies --out aidrift-vscode.vsix",
+    "package": "pnpm bundle && vsce package --no-dependencies --out aidrift-0.0.2.vsix",
     "watch": "tsc -p tsconfig.json --watch",
     "clean": "rm -rf dist *.vsix",
     "test": "echo 'no extension tests yet'"

@@ -6,6 +6,7 @@ import * as vscode from "vscode";
 const ACCESS_KEY = "aidrift.accessToken";
 const REFRESH_KEY = "aidrift.refreshToken";
 const EMAIL_KEY = "aidrift.email";
+const PAT_KEY = "aidrift.pat";
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
@@ -36,7 +37,29 @@ export class ApiClient {
   }
 
   async isSignedIn(): Promise<boolean> {
-    return Boolean(await this.secrets.get(ACCESS_KEY));
+    return Boolean((await this.secrets.get(PAT_KEY)) || (await this.secrets.get(ACCESS_KEY)));
+  }
+
+  /**
+   * Sign in with a Personal Access Token minted from the dashboard. Probes
+   * /auth/me to confirm the token is valid before persisting.
+   */
+  async loginWithToken(token: string): Promise<AuthResponse["user"]> {
+    const res = await fetch(`${this.apiBaseUrl()}/auth/me`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({})) as { error?: string };
+      throw new ApiError(res.status, body.error ?? res.statusText);
+    }
+    const user = (await res.json()) as AuthResponse["user"];
+    await this.secrets.store(PAT_KEY, token);
+    await this.secrets.store(EMAIL_KEY, user.email);
+    // Token-based login is exclusive: clear any stale JWT pair so request()
+    // doesn't accidentally fall back to expired credentials.
+    await this.secrets.delete(ACCESS_KEY);
+    await this.secrets.delete(REFRESH_KEY);
+    return user;
   }
 
   async login(email: string, password: string): Promise<AuthResponse["user"]> {
@@ -60,6 +83,7 @@ export class ApiClient {
     await this.secrets.delete(ACCESS_KEY);
     await this.secrets.delete(REFRESH_KEY);
     await this.secrets.delete(EMAIL_KEY);
+    await this.secrets.delete(PAT_KEY);
   }
 
   private async tryRefresh(): Promise<boolean> {
@@ -83,11 +107,15 @@ export class ApiClient {
   async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const headers = new Headers(init.headers);
     if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-    const access = await this.secrets.get(ACCESS_KEY);
+
+    const pat = await this.secrets.get(PAT_KEY);
+    const access = pat ?? (await this.secrets.get(ACCESS_KEY));
     if (access) headers.set("Authorization", `Bearer ${access}`);
 
     let res = await fetch(`${this.apiBaseUrl()}${path}`, { ...init, headers });
-    if (res.status === 401 && access) {
+    // PATs don't refresh — on 401 we just surface the error so the user
+    // can re-paste a token. Only the JWT path attempts auto-refresh.
+    if (res.status === 401 && !pat && access) {
       const ok = await this.tryRefresh();
       if (ok) {
         const newAccess = await this.secrets.get(ACCESS_KEY);

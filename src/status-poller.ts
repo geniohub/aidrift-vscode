@@ -10,20 +10,36 @@ interface StatusDto {
   currentScore: number | null;
   trend: "improving" | "stable" | "drifting";
   turnCount: number;
-  alert: { active: boolean; reasons: string[]; likelyDriftStartTurnId: string | null };
-  lastStableCheckpoint: { summary: string; scoreAtCheckpoint: number } | null;
+  alert: {
+    active: boolean;
+    reasons: string[];
+    likelyDriftStartTurnId: string | null;
+    type: "none" | "infra" | "tool_churn" | "stuck_loop" | "rejection_cascade" | "misalignment" | "gradual_decay";
+    recommendation: string | null;
+  };
+  lastStableCheckpoint: { turnId: string; summary: string; scoreAtCheckpoint: number } | null;
+}
+
+interface TrackingHealthDto {
+  workspacePath: string | null;
+  hasRecentActivity: boolean;
+  turnsLast24h: number;
+  lastTurnAt: string | null;
+  recommendations: string[];
 }
 
 export class StatusPoller {
   private timer: NodeJS.Timeout | undefined;
   private lastAlertActive = false;
   private lastStatus: StatusDto | null = null;
+  private lastTracking: TrackingHealthDto | null = null;
 
   constructor(
     private readonly api: ApiClient,
     private readonly statusBar: vscode.StatusBarItem,
     private readonly getActiveSessionId: () => string | null,
     private readonly getActiveTaskDescription: () => string | null,
+    private readonly getWorkspacePath: () => string | undefined,
   ) {}
 
   start(): void {
@@ -39,6 +55,10 @@ export class StatusPoller {
 
   getLastStatus(): StatusDto | null {
     return this.lastStatus;
+  }
+
+  getLastTracking(): TrackingHealthDto | null {
+    return this.lastTracking;
   }
 
   private scheduleNext(): void {
@@ -59,17 +79,25 @@ export class StatusPoller {
           this.statusBar.tooltip = "Click to sign in to AI Drift";
           this.statusBar.backgroundColor = undefined;
         } else {
-          this.statusBar.text = task ? "$(pulse) Drift —" : "$(pulse) Drift: watching";
+          const tracking = await this.fetchTrackingHealth();
+          const trackingBadge = tracking?.hasRecentActivity ? "$(pass)" : "$(warning)";
+          const trackingLabel = tracking?.hasRecentActivity ? "tracking ok" : "tracking stale";
+          this.statusBar.text = task
+            ? `${trackingBadge} Drift — ${trackingLabel}`
+            : `${trackingBadge} Drift: watching · ${trackingLabel}`;
           this.statusBar.command = "aidrift.openActiveInDashboard";
-          this.statusBar.tooltip = "AI Drift — watching for Claude Code activity";
-          this.statusBar.backgroundColor = undefined;
+          this.statusBar.tooltip = this.trackingTooltip(tracking);
+          this.statusBar.backgroundColor = tracking?.hasRecentActivity
+            ? undefined
+            : new vscode.ThemeColor("statusBarItem.warningBackground");
         }
         return;
       }
 
+      const tracking = await this.fetchTrackingHealth();
       const status = await this.api.request<StatusDto>(`/sessions/${sessionId}/status`);
       this.lastStatus = status;
-      this.render(status);
+      this.render(status, tracking);
       this.maybeNotify(status);
     } catch (err) {
       this.statusBar.text = "$(warning) Drift: api?";
@@ -80,17 +108,18 @@ export class StatusPoller {
     }
   }
 
-  private render(status: StatusDto): void {
+  private render(status: StatusDto, tracking: TrackingHealthDto | null): void {
     const score = status.currentScore;
     const trendArrow = status.trend === "improving" ? "↗" : status.trend === "drifting" ? "↘" : "→";
+    const trackingBadge = tracking?.hasRecentActivity ? "·$(pass)" : "·$(warning)";
     if (score === null) {
-      this.statusBar.text = `$(pulse) Drift — ${trendArrow}`;
+      this.statusBar.text = `$(pulse) Drift — ${trendArrow} ${trackingBadge}`;
     } else {
       const icon =
         score >= 80 ? "$(pulse)" :
         score >= 65 ? "$(alert)" :
         "$(flame)";
-      this.statusBar.text = `${icon} Drift ${score} ${trendArrow}`;
+      this.statusBar.text = `${icon} Drift ${score} ${trendArrow} ${trackingBadge}`;
     }
     this.statusBar.command = "aidrift.openActiveInDashboard";
     this.statusBar.tooltip = new vscode.MarkdownString(
@@ -99,16 +128,46 @@ export class StatusPoller {
         ``,
         `Score: ${score ?? "—"} · Trend: ${status.trend} · Turns: ${status.turnCount}`,
         status.alert.active
-          ? `\n\n⚠ **Drift alert**\n\n${status.alert.reasons.map((r) => `- ${r}`).join("\n")}`
+          ? `\n\n⚠ **Drift alert** _(${status.alert.type})_\n\n${status.alert.reasons.map((r) => `- ${r}`).join("\n")}${status.alert.recommendation ? `\n\n→ ${status.alert.recommendation}` : ""}`
           : "",
         status.lastStableCheckpoint
           ? `\n\nLast stable checkpoint: _${status.lastStableCheckpoint.summary}_ (score ${status.lastStableCheckpoint.scoreAtCheckpoint})`
+          : "",
+        tracking
+          ? `\n\nTracking: **${tracking.hasRecentActivity ? "ok" : "stale"}**` +
+            `\n\nTurns (24h): ${tracking.turnsLast24h}` +
+            `${tracking.lastTurnAt ? `\n\nLast turn: ${new Date(tracking.lastTurnAt).toLocaleString()}` : ""}` +
+            `${tracking.recommendations.length > 0 ? `\n\n${tracking.recommendations.map((r) => `- ${r}`).join("\n")}` : ""}`
           : "",
       ].join(""),
     );
     this.statusBar.backgroundColor = status.alert.active
       ? new vscode.ThemeColor("statusBarItem.errorBackground")
-      : undefined;
+      : tracking && !tracking.hasRecentActivity
+        ? new vscode.ThemeColor("statusBarItem.warningBackground")
+        : undefined;
+  }
+
+  private async fetchTrackingHealth(): Promise<TrackingHealthDto | null> {
+    try {
+      const workspace = this.getWorkspacePath();
+      const query = workspace ? `?workspacePath=${encodeURIComponent(workspace)}` : "";
+      const tracking = await this.api.request<TrackingHealthDto>(`/tracking/health${query}`);
+      this.lastTracking = tracking;
+      return tracking;
+    } catch {
+      return this.lastTracking;
+    }
+  }
+
+  private trackingTooltip(tracking: TrackingHealthDto | null): string {
+    if (!tracking) return "AI Drift — tracking status unavailable";
+    return [
+      `AI Drift — tracking ${tracking.hasRecentActivity ? "ok" : "stale"}`,
+      `Turns (24h): ${tracking.turnsLast24h}`,
+      tracking.lastTurnAt ? `Last turn: ${new Date(tracking.lastTurnAt).toLocaleString()}` : "Last turn: none",
+      ...(tracking.recommendations ?? []),
+    ].join("\n");
   }
 
   private maybeNotify(status: StatusDto): void {
@@ -119,14 +178,23 @@ export class StatusPoller {
     if (this.lastAlertActive) return; // already notified for this alert window
     this.lastAlertActive = true;
 
+    const hasCheckpoint = !!status.lastStableCheckpoint;
     const summary = status.lastStableCheckpoint
       ? `Last stable checkpoint: "${status.lastStableCheckpoint.summary}" (score ${status.lastStableCheckpoint.scoreAtCheckpoint}).`
       : "No stable checkpoint yet.";
     const msg = `⚠ Possible drift in "${status.session.taskDescription}" — score ${status.currentScore ?? "—"}. ${summary}`;
+
+    // The Revert action only appears when there's a checkpoint to revert to,
+    // otherwise it would be a dead button.
+    const actions = hasCheckpoint
+      ? ["Revert to Last Stable", "Open in Dashboard", "Create Checkpoint", "Dismiss"]
+      : ["Open in Dashboard", "Create Checkpoint", "Dismiss"];
     void vscode.window
-      .showWarningMessage(msg, "Open in Dashboard", "Create Checkpoint", "Dismiss")
+      .showWarningMessage(msg, ...actions)
       .then((choice) => {
-        if (choice === "Open in Dashboard") {
+        if (choice === "Revert to Last Stable") {
+          void vscode.commands.executeCommand("aidrift.revertToLastCheckpoint");
+        } else if (choice === "Open in Dashboard") {
           void vscode.commands.executeCommand("aidrift.openActiveInDashboard");
         } else if (choice === "Create Checkpoint") {
           void vscode.commands.executeCommand("aidrift.createCheckpoint");

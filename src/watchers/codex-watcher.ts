@@ -3,9 +3,9 @@
 // own stateful parser (Codex needs to see session_meta first).
 
 import chokidar, { type FSWatcher } from "chokidar";
-import { createReadStream, statSync } from "node:fs";
+import { createReadStream, promises as fsp, statSync, type Dirent } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { ParsedEntry } from "./jsonl-parser.js";
 import { createCodexParser, sessionHintFromFilename } from "./codex-parser.js";
 
@@ -24,9 +24,13 @@ export class CodexWatcher {
   async start(): Promise<void> {
     this.watcher = chokidar.watch(`${this.rootDir}/**/rollout-*.jsonl`, {
       persistent: true,
-      ignoreInitial: false,
+      // We perform our own deterministic initial scan on "ready" because
+      // chokidar initial add events can be missed on some hosts.
+      ignoreInitial: true,
+      followSymlinks: false,
       awaitWriteFinish: { stabilityThreshold: 150, pollInterval: 50 },
     });
+    this.watcher.on("ready", () => void this.ingestExistingFiles());
     this.watcher.on("add", (p) => void this.ingest(p));
     this.watcher.on("change", (p) => void this.ingest(p));
   }
@@ -89,5 +93,34 @@ export class CodexWatcher {
       }
     }
     this.offsets.set(filePath, size);
+  }
+
+  private async ingestExistingFiles(): Promise<void> {
+    const files = await this.listRolloutFiles(this.rootDir);
+    files.sort();
+    for (const filePath of files) {
+      await this.ingest(filePath);
+    }
+  }
+
+  private async listRolloutFiles(dir: string): Promise<string[]> {
+    let entries: Dirent[];
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    const out: string[] = [];
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        out.push(...(await this.listRolloutFiles(full)));
+        continue;
+      }
+      if (entry.isFile() && basename(entry.name).startsWith("rollout-") && entry.name.endsWith(".jsonl")) {
+        out.push(full);
+      }
+    }
+    return out;
   }
 }

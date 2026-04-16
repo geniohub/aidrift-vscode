@@ -29,6 +29,7 @@ export class ClaudeCodeWatcher {
     this.watcher = chokidar.watch(`${this.rootDir}/**/*.jsonl`, {
       persistent: true,
       ignoreInitial: false,
+      followSymlinks: false,
       awaitWriteFinish: { stabilityThreshold: 150, pollInterval: 50 },
     });
 

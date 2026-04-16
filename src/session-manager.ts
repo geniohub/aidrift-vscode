@@ -12,13 +12,17 @@ interface PendingPair {
   userPromptText: string;
   userPromptUuid: string;
   assistantChunks: string[];
+  toolCalls: string[];
   model?: string;
+  provider: "claude-code" | "codex";
+  workspacePath?: string;
 }
 
 interface SessionDto {
   id: string;
   sessionHint: string | null;
   taskDescription: string;
+  workspacePath: string | null;
 }
 
 interface TurnSummary {
@@ -32,12 +36,15 @@ const REJECT_PATTERNS = /\b(no|nope|wrong|incorrect|actually|instead|still|broke
 const IMPLICIT_REJECT_SIMILARITY = 0.6;
 const IMPLICIT_ACCEPT_MS = 5 * 60 * 1000; // 5 minutes
 const SWEEP_INTERVAL_MS = 30 * 1000;
+const ASSISTANT_FLUSH_DEBOUNCE_MS = 1200;
 
 export class SessionManager {
   /** sessionHint (Claude transcript UUID) → our Session.id */
   private readonly sessionBySH = new Map<string, string>();
   /** Pending turn being assembled per sessionHint */
   private readonly pending = new Map<string, PendingPair>();
+  /** Debounced auto-flush timer per pending sessionHint */
+  private readonly pendingFlushTimers = new Map<string, NodeJS.Timeout>();
   /** Most-recent unsettled turn per sessionId, used for implicit outcomes */
   private readonly lastTurn = new Map<string, TurnSummary>();
   /** Recently-seen turn ids (with their session) for the acceptTimer sweep */
@@ -58,6 +65,27 @@ export class SessionManager {
       clearInterval(this.sweepTimer);
       this.sweepTimer = undefined;
     }
+    for (const timer of this.pendingFlushTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingFlushTimers.clear();
+  }
+
+  /**
+   * Clears in-memory mapping/state so a new auth context (different user)
+   * can safely re-ingest transcripts without stale session ids.
+   */
+  reset(): void {
+    for (const timer of this.pendingFlushTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingFlushTimers.clear();
+    this.sessionBySH.clear();
+    this.pending.clear();
+    this.lastTurn.clear();
+    this.unsettled.clear();
+    this.activeSessionId = null;
+    this.activeTaskDescription = null;
   }
 
   getActiveSessionId(): string | null {
@@ -68,39 +96,81 @@ export class SessionManager {
     return this.activeTaskDescription;
   }
 
-  private async ensureSession(sessionHint: string, suggestedTask: string, provider: "claude-code" | "codex"): Promise<string> {
-    const cached = this.sessionBySH.get(sessionHint);
-    if (cached) return cached;
-    try {
-      const existing = await this.api.request<SessionDto>(`/sessions/by-hint/${encodeURIComponent(sessionHint)}`);
-      this.sessionBySH.set(sessionHint, existing.id);
-      this.activeTaskDescription = existing.taskDescription;
-      return existing.id;
-    } catch (err) {
-      const e = err as { status?: number };
-      if (e.status !== 404) throw err;
-    }
-    const task = suggestedTask.slice(0, 200) || `${provider} session`;
-    const created = await this.api.request<SessionDto>("/sessions", {
-      method: "POST",
-      body: JSON.stringify({
-        taskDescription: task,
-        provider,
-        sessionHint,
-        autoCheckpointEnabled: true,
-      }),
-    });
-    this.sessionBySH.set(sessionHint, created.id);
-    this.activeTaskDescription = created.taskDescription;
-    return created.id;
+  private cacheSession(session: SessionDto): string {
+    if (session.sessionHint) this.sessionBySH.set(session.sessionHint, session.id);
+    this.activeTaskDescription = session.taskDescription;
+    return session.id;
   }
 
-  async handleEntry(entry: ParsedEntry, provider: "claude-code" | "codex" = "claude-code"): Promise<void> {
+  private async findSessionByHint(sessionHint: string, workspacePath?: string): Promise<SessionDto | null> {
+    const query = workspacePath ? `?workspacePath=${encodeURIComponent(workspacePath)}` : "";
+    try {
+      return await this.api.request<SessionDto>(`/sessions/by-hint/${encodeURIComponent(sessionHint)}${query}`);
+    } catch (err) {
+      const e = err as { status?: number };
+      if (e.status === 404) return null;
+      throw err;
+    }
+  }
+
+  private async ensureSession(
+    sessionHint: string,
+    suggestedTask: string,
+    provider: "claude-code" | "codex",
+    workspacePath?: string,
+  ): Promise<string> {
+    const cached = this.sessionBySH.get(sessionHint);
+    if (cached) return cached;
+    const existing = await this.findSessionByHint(sessionHint, workspacePath);
+    if (existing) return this.cacheSession(existing);
+
+    const task = suggestedTask.slice(0, 200) || `${provider} session`;
+    try {
+      const created = await this.api.request<SessionDto>("/sessions", {
+        method: "POST",
+        body: JSON.stringify({
+          taskDescription: task,
+          provider,
+          sessionHint,
+          autoCheckpointEnabled: true,
+          workspacePath,
+        }),
+      });
+      return this.cacheSession(created);
+    } catch (createErr) {
+      // A concurrent create (or prior collision resolved server-side) can make
+      // the insert fail; re-read once by hint before surfacing the error.
+      const raced = await this.findSessionByHint(sessionHint, workspacePath);
+      if (raced) return this.cacheSession(raced);
+      throw createErr;
+    }
+  }
+
+  async handleEntry(
+    entry: ParsedEntry,
+    provider: "claude-code" | "codex" = "claude-code",
+    workspacePath?: string,
+  ): Promise<void> {
     if (entry.kind === "skip") return;
+    const effectiveWorkspacePath = workspacePath ?? entry.workspacePath;
 
     if (entry.kind === "user-prompt") {
+      // Bootstrap a session as soon as the first prompt is seen so tracking
+      // appears immediately, even before the assistant reply is flushed.
+      try {
+        const sid = await this.ensureSession(
+          entry.sessionHint,
+          entry.text,
+          provider,
+          effectiveWorkspacePath,
+        );
+        this.activeSessionId = sid;
+      } catch (err) {
+        console.error("[aidrift] ensureSession bootstrap failed:", err);
+      }
+
       // 1. Flush the previous user/assistant pair (if any) — this lands the turn.
-      await this.flushPending(entry.sessionHint, provider);
+      await this.flushPending(entry.sessionHint);
 
       // 2. Implicit-reject check against the last-posted turn in THIS session.
       await this.maybeImplicitReject(entry.sessionHint, entry.text);
@@ -109,6 +179,9 @@ export class SessionManager {
         userPromptText: entry.text,
         userPromptUuid: entry.uuid,
         assistantChunks: [],
+        toolCalls: [],
+        provider,
+        workspacePath: effectiveWorkspacePath,
       });
       return;
     }
@@ -116,8 +189,22 @@ export class SessionManager {
     // assistant-reply
     const p = this.pending.get(entry.sessionHint);
     if (!p) return;
-    p.assistantChunks.push(entry.text);
+    if (entry.text) p.assistantChunks.push(entry.text);
+    if (entry.toolCalls.length > 0) p.toolCalls.push(...entry.toolCalls);
     if (entry.model) p.model = entry.model;
+    // Debounced flush avoids waiting for the next user prompt before creating
+    // the first tracked turn/session.
+    this.schedulePendingFlush(entry.sessionHint);
+  }
+
+  private schedulePendingFlush(sessionHint: string): void {
+    const prev = this.pendingFlushTimers.get(sessionHint);
+    if (prev) clearTimeout(prev);
+    const timer = setTimeout(() => {
+      this.pendingFlushTimers.delete(sessionHint);
+      void this.flushPending(sessionHint);
+    }, ASSISTANT_FLUSH_DEBOUNCE_MS);
+    this.pendingFlushTimers.set(sessionHint, timer);
   }
 
   private async maybeImplicitReject(sessionHint: string, newPrompt: string): Promise<void> {
@@ -143,11 +230,21 @@ export class SessionManager {
     }
   }
 
-  private async flushPending(sessionHint: string, provider: "claude-code" | "codex"): Promise<void> {
+  private async flushPending(sessionHint: string): Promise<void> {
+    const timer = this.pendingFlushTimers.get(sessionHint);
+    if (timer) {
+      clearTimeout(timer);
+      this.pendingFlushTimers.delete(sessionHint);
+    }
     const p = this.pending.get(sessionHint);
     if (!p) return;
-    if (p.assistantChunks.length === 0) return;
-    const sessionId = await this.ensureSession(sessionHint, p.userPromptText, provider);
+    if (p.assistantChunks.length === 0 && p.toolCalls.length === 0) return;
+    const sessionId = await this.ensureSession(
+      sessionHint,
+      p.userPromptText,
+      p.provider,
+      p.workspacePath,
+    );
     try {
       const turn = await this.api.request<{ id: string }>(`/sessions/${sessionId}/turns`, {
         method: "POST",
@@ -155,9 +252,10 @@ export class SessionManager {
           userPrompt: p.userPromptText,
           modelResponse: p.assistantChunks.join("\n\n"),
           metadata: {
-            source: `${provider}-jsonl`,
+            source: `${p.provider}-jsonl`,
             userPromptUuid: p.userPromptUuid,
             model: p.model,
+            toolCalls: p.toolCalls,
           },
         }),
       });
