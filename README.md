@@ -17,12 +17,17 @@ Requires an AI Drift backend running. For local dev: clone the repo, `docker com
 
 ## Commands
 
-- `Drift: Sign In` / `Drift: Sign Out` / `Drift: Show Signed-In User`
-- `Drift: Show Status for Active Session`
-- `Drift: Debug Tracking` (prints watcher/user/workspace + `/tracking/health` diagnostics)
-- `Drift: Open Active Session in Dashboard`
-- `Drift: Mark Last Turn Accepted` / `Drift: Mark Last Turn Rejected`
-- `Drift: Create Checkpoint for Active Session`
+| Command | Purpose |
+| --- | --- |
+| `Drift: Sign In` | Authenticate via browser OAuth or token paste |
+| `Drift: Sign Out` | Clear stored credentials |
+| `Drift: Show Signed-In User` | Display current authenticated user |
+| `Drift: Show Status for Active Session` | Show drift score and session info in a notification |
+| `Drift: Debug Tracking` | Print watcher/user/workspace + `/tracking/health` diagnostics |
+| `Drift: Open Active Session in Dashboard` | Open the web dashboard scoped to the active session |
+| `Drift: Mark Last Turn Accepted` | Mark the latest turn as accepted |
+| `Drift: Mark Last Turn Rejected` | Mark the latest turn as rejected |
+| `Drift: Create Checkpoint for Active Session` | Pin the latest turn as a manual checkpoint |
 
 ## Settings
 
