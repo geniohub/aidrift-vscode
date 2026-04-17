@@ -2,17 +2,31 @@
   "name": "aidrift",
   "displayName": "AI Drift Detector",
   "description": "Watches your AI coding chats (Claude Code, Codex) and warns when sessions drift.",
-  "version": "0.0.20",
-  "publisher": "aidrift",
+  "version": "0.0.24",
+  "publisher": "GenioHub",
   "private": false,
+  "icon": "media/icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Other"],
+  "categories": ["AI", "Other"],
+  "keywords": [
+    "ai",
+    "claude",
+    "claude code",
+    "codex",
+    "drift",
+    "productivity",
+    "observability"
+  ],
   "license": "MIT",
+  "homepage": "https://drift.geniohub.com",
   "repository": {
     "type": "git",
-    "url": "https://github.com/alper/AiDrift.git"
+    "url": "https://github.com/geniohub/AiDriftClient.git"
+  },
+  "bugs": {
+    "url": "https://github.com/geniohub/AiDriftClient/issues"
   },
   "activationEvents": ["onStartupFinished"],
   "main": "./dist/extension.js",
@@ -40,6 +54,7 @@
       { "command": "aidrift.refreshSessions", "title": "Drift: Refresh Sessions", "icon": "$(refresh)" },
       { "command": "aidrift.switchProfile", "title": "Drift: Switch Profile" },
       { "command": "aidrift.addProfile", "title": "Drift: Add Profile" },
+      { "command": "aidrift.editProfile", "title": "Drift: Edit Profile" },
       { "command": "aidrift.removeProfile", "title": "Drift: Remove Profile" },
       { "command": "aidrift.showCurrentProfile", "title": "Drift: Show Current Profile" }
     ],

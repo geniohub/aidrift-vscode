@@ -142,6 +142,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("aidrift.refreshSessions", () => treeProvider?.refresh()),
     vscode.commands.registerCommand("aidrift.switchProfile", () => switchProfileFlow()),
     vscode.commands.registerCommand("aidrift.addProfile", () => addProfileFlow()),
+    vscode.commands.registerCommand("aidrift.editProfile", () => editProfileFlow()),
     vscode.commands.registerCommand("aidrift.removeProfile", () => removeProfileFlow()),
     vscode.commands.registerCommand("aidrift.showCurrentProfile", () => showCurrentProfileFlow()),
     vscode.commands.registerCommand(
@@ -545,6 +546,12 @@ async function switchProfileFlow(): Promise<void> {
     name: "__add__",
     alwaysShow: true,
   });
+  items.push({
+    label: "$(edit) Edit profile…",
+    description: "Rename or change the API / dashboard URL",
+    name: "__edit__",
+    alwaysShow: true,
+  });
   const pick = await vscode.window.showQuickPick(items, {
     placeHolder: "Select AI Drift profile",
     ignoreFocusOut: true,
@@ -552,6 +559,10 @@ async function switchProfileFlow(): Promise<void> {
   if (!pick) return;
   if (pick.name === "__add__") {
     await addProfileFlow();
+    return;
+  }
+  if (pick.name === "__edit__") {
+    await editProfileFlow();
     return;
   }
   try {
@@ -602,6 +613,56 @@ async function addProfileFlow(): Promise<void> {
     }
   } catch (err) {
     void vscode.window.showErrorMessage(`Add profile failed: ${(err as Error).message}`);
+  }
+}
+
+async function editProfileFlow(): Promise<void> {
+  const items = profiles.list().map((p) => ({
+    label: (p.active ? "$(check) " : "$(circle-outline) ") + p.name,
+    description: p.config.apiBaseUrl,
+    name: p.name,
+    config: p.config,
+  }));
+  const pick = await vscode.window.showQuickPick(items, {
+    placeHolder: "Edit which profile?",
+    ignoreFocusOut: true,
+  });
+  if (!pick) return;
+
+  const newName = await vscode.window.showInputBox({
+    prompt: "Profile name",
+    value: pick.name,
+    ignoreFocusOut: true,
+    validateInput: (v) => (/^[a-zA-Z0-9_-]+$/.test(v) ? undefined : "letters, digits, _ or - only"),
+  });
+  if (!newName) return;
+
+  const newApi = await vscode.window.showInputBox({
+    prompt: "API base URL",
+    value: pick.config.apiBaseUrl,
+    ignoreFocusOut: true,
+  });
+  if (!newApi) return;
+
+  const defaultDash = pick.config.dashboardUrl
+    ?? (newApi.replace(/\/api\/?$/, "") || DEFAULT_DASHBOARD_URL);
+  const newDash = await vscode.window.showInputBox({
+    prompt: "Dashboard URL",
+    value: defaultDash,
+    ignoreFocusOut: true,
+  });
+  if (newDash === undefined) return;
+
+  try {
+    if (newName !== pick.name) {
+      await profiles.rename(pick.name, newName);
+    }
+    await profiles.update(newName, { apiBaseUrl: newApi, dashboardUrl: newDash });
+    void vscode.window.showInformationMessage(
+      `Profile "${newName}" updated (${newApi}).`,
+    );
+  } catch (err) {
+    void vscode.window.showErrorMessage(`Edit failed: ${(err as Error).message}`);
   }
 }
 

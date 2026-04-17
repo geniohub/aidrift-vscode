@@ -150,6 +150,21 @@ export class ApiClient {
   }
 
   async logout(): Promise<void> {
+    const pat = await this.secrets.get(this.key("pat"));
+    if (pat) {
+      // Best-effort: revoke server-side so stale tokens don't pile up in
+      // /settings/tokens. If offline or the server rejects, still sign out
+      // locally — the user asked to log out.
+      try {
+        await this.fetchWithTimeout(
+          `${this.apiBaseUrl()}/auth/pats/current`,
+          { method: "DELETE", headers: { Authorization: `Bearer ${pat}` } },
+          this.requestTimeoutMs(),
+        );
+      } catch {
+        // swallow
+      }
+    }
     await this.secrets.delete(this.key("accessToken"));
     await this.secrets.delete(this.key("refreshToken"));
     await this.secrets.delete(this.key("email"));

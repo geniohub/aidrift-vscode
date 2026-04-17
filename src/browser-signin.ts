@@ -4,7 +4,7 @@
 //      dashboard's /connect/vscode?state=… page in the browser.
 //   2. The user logs in/signs up on the dashboard if needed.
 //   3. The dashboard mints a PAT, then redirects the browser to
-//      vscode://aidrift.aidrift/callback?token=…&state=…
+//      vscode://geniohub.aidrift/callback?token=…&state=…
 //   4. `handleCallback()` verifies the state matches the one we generated,
 //      then stores the token against the active profile via ApiClient.
 
@@ -65,7 +65,7 @@ export class BrowserSignIn {
   }
 
   /**
-   * Handle vscode://aidrift.aidrift/callback?token=…&state=…
+   * Handle vscode://geniohub.aidrift/callback?token=…&state=…
    *
    * Validates the state against the one we generated, stores the token
    * against the profile that was active when the flow started.

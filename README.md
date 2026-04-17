@@ -6,33 +6,96 @@ VSCode extension that watches your Claude Code and OpenAI Codex chats and warns 
 
 - Auto-detects new Claude Code transcripts at `~/.claude/projects/**/*.jsonl` and Codex rollouts at `~/.codex/sessions/**/rollout-*.jsonl`
 - Creates a drift session per chat tab and posts turns as they happen
-- Live status bar showing score (0–100) and trend (↗ / → / ↘)
+- Live status bar showing the active profile; click it to switch profiles
 - Notification with actions when drift is detected
-- Sidebar list of recent sessions
-- Status bar includes tracking health badge (`tracking ok` / `tracking stale`) based on `/tracking/health`
+- Sidebar list of recent sessions (AI Drift activity-bar view)
+- Reports VSCode task and terminal outcomes (lint/build/test pass/fail) for the active turn
+- Watches `.git/refs/` for commits and pushes and attaches them to the session timeline
+
+## Install
+
+AI Drift is in **private beta**. The extension is not yet on the VS Code Marketplace — install it from the code-gated `.vsix`:
+
+```bash
+# 1. Open the gated download page and paste your invite code
+open "https://drift.geniohub.com/download?code=YOUR_CODE"
+
+# 2. Install the downloaded .vsix
+code --install-extension ~/Downloads/aidrift-*.vsix
+```
+
+Request an invite code at <https://drift.geniohub.com/request-access>.
 
 ## Setup
 
-Requires an AI Drift backend running. For local dev: clone the repo, `docker compose up -d`, set `aidrift.apiBaseUrl` to your deployment (defaults to `http://localhost:3331/api`), and sign in via `Drift: Sign In`.
+Requires an AI Drift backend. The default profile points at `https://drift.geniohub.com`. For local dev, run `docker compose up -d` in the repo root, then use **Drift: Add Profile** to register `http://localhost:3331/api` and switch to it.
+
+Sign in via the welcome view in the AI Drift sidebar, the walkthrough, or `Drift: Sign In`. Browser sign-in is the recommended path — it opens the dashboard, you log in or register, and the token is delivered back to the editor via the `vscode://` URI handler.
 
 ## Commands
 
-| Command | Purpose |
+All commands are available from the Command Palette (`Cmd+Shift+P`) under the `Drift:` prefix. Some are also surfaced from the status bar, the sidebar welcome view, and the walkthrough.
+
+### Authentication
+
+| Command | How to use |
 | --- | --- |
-| `Drift: Sign In` | Authenticate via browser OAuth or token paste |
-| `Drift: Sign Out` | Clear stored credentials |
-| `Drift: Show Signed-In User` | Display current authenticated user |
-| `Drift: Show Status for Active Session` | Show drift score and session info in a notification |
-| `Drift: Debug Tracking` | Print watcher/user/workspace + `/tracking/health` diagnostics |
-| `Drift: Open Active Session in Dashboard` | Open the web dashboard scoped to the active session |
-| `Drift: Mark Last Turn Accepted` | Mark the latest turn as accepted |
-| `Drift: Mark Last Turn Rejected` | Mark the latest turn as rejected |
-| `Drift: Create Checkpoint for Active Session` | Pin the latest turn as a manual checkpoint |
+| `Drift: Sign In` | Opens a quick-pick with three sign-in methods (browser / token / email+password). Pick one and follow the prompts. |
+| `Drift: Sign In with Browser` | Opens the active profile's dashboard at `/cli-signin?callback=vscode://…`. After you log in or sign up, the dashboard redirects back and the token is stored automatically. |
+| `Drift: Sign In with Token` | Prompts for a Personal Access Token (`aidrift_pat_…`) copied from the dashboard. Paste and confirm. |
+| `Drift: Sign In with Email + Password` | Prompts for email, then password. Only works for accounts registered with a password. |
+| `Drift: Sign Out` | Clears the stored token for the active profile, stops all watchers, and resets the status bar. |
+| `Drift: Show Signed-In User` | Calls `/auth/me` and shows the current email + user id, or warns if the session expired. |
+
+### Profiles (multi-host support)
+
+A "profile" is a named `{apiBaseUrl, dashboardUrl}` pair with its own stored token. The active profile name is shown in the status bar; clicking it runs `Drift: Switch Profile`.
+
+| Command | How to use |
+| --- | --- |
+| `Drift: Switch Profile` | Quick-pick of profiles; the active one has a check mark. Also includes `Add profile…` and `Edit profile…` shortcuts. Switching restarts the watchers against the new host. |
+| `Drift: Add Profile` | Prompts for name (letters/digits/`_`/`-`), API base URL, and dashboard URL. Offers to switch to the new profile immediately. |
+| `Drift: Edit Profile` | Pick a profile, then edit its name, API URL, and dashboard URL. |
+| `Drift: Remove Profile` | Pick a non-active profile; confirms with a modal before deleting the profile and its stored credentials. Cannot remove the active profile — switch first. |
+| `Drift: Show Current Profile` | Shows the active profile name, API URL, and signed-in email (or "not signed in"). |
+
+### Session control
+
+These operate on the currently tracked session (the most recent chat the watcher attached to).
+
+| Command | How to use |
+| --- | --- |
+| `Drift: Show Status for Active Session` | Shows a notification with the last cached drift score, trend, task description, and any active alert reasons. |
+| `Drift: Mark Last Turn Accepted` | Marks the most recent turn as accepted via `PATCH /turns/:id/outcome`. Feeds the acceptance-rate signal. |
+| `Drift: Mark Last Turn Rejected` | Same as above but marks the turn rejected. |
+| `Drift: Create Checkpoint for Active Session` | Prompts for a summary, then creates a manual checkpoint on the latest turn and records the current `git rev-parse HEAD` if available. |
+| `Drift: Open Last Stable Checkpoint` | Opens the dashboard at the most recent checkpointed turn (anchor `#turn-…`). Warns if no stable checkpoint exists yet. |
+
+### Dashboard + diagnostics
+
+| Command | How to use |
+| --- | --- |
+| `Drift: Open Active Session in Dashboard` | Opens `{dashboardUrl}/sessions/{activeId}?workspacePath=…` in the system browser. Falls back to `/sessions` if no active session. |
+| `Drift: Open Session in Dashboard` | Programmatic variant that takes a `sessionId` argument (used by the sidebar tree; not normally invoked by hand). |
+| `Drift: Refresh Sessions` | Refreshes the sidebar tree. Also exposed as the refresh icon in the AI Drift view title. |
+| `Drift: Debug Tracking` | Dumps watcher state, workspace root, active session id, and a call to `/tracking/health` into a new `AI Drift Tracking` output channel. Use when sessions aren't appearing. |
+
+## UI surfaces
+
+- **Activity bar view `AI Drift`** — tree of recent sessions. Auto-refreshes. Shows a welcome view with sign-in buttons when signed out.
+- **Status bar item** — `$(pulse) aidrift: {profile}`. Click to switch profiles. Tooltip shows the API URL.
+- **Walkthrough `Get Started with AI Drift`** — three steps: sign in, switch profiles, open the view. Available from the VSCode Walkthroughs page.
+- **URI handler** — `vscode://geniohub.aidrift/signin-callback?token=…` is how the browser sign-in delivers the token back. `vscode://geniohub.aidrift/open-diff?...` opens a diff from the dashboard.
 
 ## Settings
 
-- `aidrift.apiBaseUrl` — AI Drift API base URL (default `http://localhost:3331/api`)
-- `aidrift.dashboardUrl` — dashboard base URL (default `http://localhost:3331`)
-- `aidrift.watchClaudeCode` — enable Claude Code transcript watcher (default `true`)
-- `aidrift.watchCodex` — enable OpenAI Codex rollout watcher (default `true`)
-- `aidrift.statusPollIntervalSeconds` — poll interval for status bar (default `3`)
+- `aidrift.watchClaudeCode` (default `true`) — watch `~/.claude/projects/` for transcripts.
+- `aidrift.watchCodex` (default `true`) — watch `~/.codex/sessions/` for rollouts.
+- `aidrift.trackTaskExecution` (default `true`) — report VSCode task/terminal outcomes for the active turn. Terminal coverage requires shell integration (VSCode 1.93+).
+- `aidrift.watchGitEvents` (default `true`) — watch `.git/refs/` for commits and pushes.
+- `aidrift.statusPollIntervalSeconds` (default `30`) — poll interval for `/sessions/:id/status`. Backs off exponentially on failure, cap 5 min.
+- `aidrift.requestTimeoutSeconds` (default `10`, min `2`) — HTTP timeout for extension → API calls.
+- `aidrift.driftAlertThreshold` (default `65`) — score below which a drift alert fires.
+- `aidrift.autoCheckpoint` (default `true`) — auto-checkpoint on every accepted turn.
+- `aidrift.implicitAcceptTimeoutSeconds` (default `300`) — seconds without a follow-up before a turn is treated as implicitly accepted.
+- `aidrift.apiBaseUrl`, `aidrift.dashboardUrl` — **deprecated**, ignored once profiles are configured. Use `Drift: Add Profile` / `Drift: Switch Profile` instead.

@@ -166,6 +166,36 @@ export class ProfileManager {
     if (name === this.state.active) this.onDidChangeEmitter.fire(name);
   }
 
+  async rename(oldName: string, newName: string): Promise<void> {
+    if (oldName === newName) return;
+    if (!newName || /[^a-zA-Z0-9_-]/.test(newName)) {
+      throw new Error(`invalid profile name "${newName}" (use letters, digits, _ or -)`);
+    }
+    const existing = this.state.profiles[oldName];
+    if (!existing) throw new Error(`no profile named "${oldName}"`);
+    if (this.state.profiles[newName]) {
+      throw new Error(`profile "${newName}" already exists`);
+    }
+
+    this.state.profiles[newName] = existing;
+    delete this.state.profiles[oldName];
+    if (this.state.active === oldName) this.state.active = newName;
+
+    // Move secrets: aidrift.profile.<oldName>.* → aidrift.profile.<newName>.*
+    for (const kind of ["accessToken", "refreshToken", "email", "pat"]) {
+      const oldKey = `aidrift.profile.${oldName}.${kind}`;
+      const newKey = `aidrift.profile.${newName}.${kind}`;
+      const val = await this.ctx.secrets.get(oldKey);
+      if (val !== undefined) {
+        await this.ctx.secrets.store(newKey, val);
+        await this.ctx.secrets.delete(oldKey);
+      }
+    }
+
+    await this.persist();
+    this.onDidChangeEmitter.fire(this.state.active);
+  }
+
   dispose(): void {
     this.onDidChangeEmitter.dispose();
   }
