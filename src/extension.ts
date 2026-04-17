@@ -1,18 +1,36 @@
 import * as vscode from "vscode";
+import { execFile } from "node:child_process";
 import { normalize } from "node:path";
+import { promisify } from "node:util";
 import { VERSION } from "@aidrift/core";
 import { ApiClient, ApiError } from "./api-client";
 import { ClaudeCodeWatcher } from "./watchers/claude-code-watcher";
 import { CodexWatcher } from "./watchers/codex-watcher";
 import { SessionManager } from "./session-manager";
 import { StatusPoller } from "./status-poller";
+import { TaskWatcher } from "./task-watcher";
+import { GitWatcher } from "./watchers/git-watcher";
 import { SessionsTreeProvider } from "./views/sessions-tree";
+import { registerDiffUriHandler, openDiffInVscode } from "./diff-handler";
+
+const execFileAsync = promisify(execFile);
+
+async function currentHeadSha(cwd: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+    return stdout.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 let statusBar: vscode.StatusBarItem;
 let apiClient: ApiClient;
 let sessionManager: SessionManager;
 let claudeWatcher: ClaudeCodeWatcher | undefined;
 let codexWatcher: CodexWatcher | undefined;
+let taskWatcher: TaskWatcher | undefined;
+let gitWatcher: GitWatcher | undefined;
 let poller: StatusPoller | undefined;
 let treeProvider: SessionsTreeProvider | undefined;
 
@@ -110,6 +128,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("aidrift.openActiveInDashboard", () => openActiveInDashboard()),
     vscode.commands.registerCommand("aidrift.openSessionInDashboard", (sessionId?: string) => openSessionInDashboard(sessionId)),
     vscode.commands.registerCommand("aidrift.refreshSessions", () => treeProvider?.refresh()),
+    vscode.commands.registerCommand(
+      "aidrift.openDiff",
+      (args: { fromSha?: string; toSha?: string; filePath?: string } | undefined) =>
+        openDiffInVscode({
+          fromSha: args?.fromSha,
+          toSha: args?.toSha,
+          filePath: args?.filePath,
+          workspaceRoots: workspaceRoots(),
+        }),
+    ),
+  );
+  context.subscriptions.push(
+    registerDiffUriHandler({
+      workspaceRoots,
+    }),
   );
 
   // Start the watcher if already signed in.
@@ -136,7 +169,7 @@ async function startWatchers(): Promise<void> {
   }
   if (!codexWatcher && cfg.get<boolean>("watchCodex", true)) {
     codexWatcher = new CodexWatcher((entry) => {
-      const workspacePath = (entry.kind === "skip" || entry.kind === "ai-title") ? undefined : entry.workspacePath;
+      const workspacePath = (entry.kind === "skip" || entry.kind === "ai-title" || entry.kind === "tool-results") ? undefined : entry.workspacePath;
       if (!isInActiveWorkspace(workspacePath)) return Promise.resolve();
       return sessionManager.handleEntry(entry, "codex", workspacePath);
     });
@@ -148,6 +181,26 @@ async function startWatchers(): Promise<void> {
       codexWatcher = undefined;
     }
   }
+  if (!taskWatcher && cfg.get<boolean>("trackTaskExecution", true)) {
+    taskWatcher = new TaskWatcher(apiClient, sessionManager);
+    taskWatcher.start();
+    console.log("[aidrift] Task watcher started");
+  }
+  if (!gitWatcher && cfg.get<boolean>("watchGitEvents", true)) {
+    gitWatcher = new GitWatcher(
+      apiClient,
+      () => sessionManager.getActiveSessionId(),
+      () => sessionManager.getLastTurnId(),
+      workspaceRoots,
+    );
+    try {
+      await gitWatcher.start();
+      console.log("[aidrift] Git watcher started");
+    } catch (err) {
+      console.error("[aidrift] git watcher failed:", err);
+      gitWatcher = undefined;
+    }
+  }
 }
 
 async function stopWatchers(): Promise<void> {
@@ -155,6 +208,10 @@ async function stopWatchers(): Promise<void> {
   claudeWatcher = undefined;
   await codexWatcher?.stop();
   codexWatcher = undefined;
+  taskWatcher?.stop();
+  taskWatcher = undefined;
+  await gitWatcher?.stop();
+  gitWatcher = undefined;
 }
 
 // ---------- commands ----------
@@ -293,11 +350,17 @@ async function createCheckpointFlow(): Promise<void> {
       void vscode.window.showWarningMessage("No turns yet.");
       return;
     }
+    const root = firstWorkspaceRoot();
+    const gitSha = root ? await currentHeadSha(root) : undefined;
     await apiClient.request(`/sessions/${sid}/checkpoints`, {
       method: "POST",
-      body: JSON.stringify({ turnId: last.id, summary, source: "manual" }),
+      body: JSON.stringify({ turnId: last.id, summary, source: "manual", gitSha }),
     });
-    void vscode.window.showInformationMessage(`Checkpoint created.`);
+    void vscode.window.showInformationMessage(
+      gitSha
+        ? `Checkpoint created (git ${gitSha.slice(0, 7)}).`
+        : `Checkpoint created.`,
+    );
   } catch (err) {
     void vscode.window.showErrorMessage(`Failed: ${(err as Error).message}`);
   }

@@ -122,6 +122,8 @@ export function createCodexParser(initialHint: string | null): (line: string) =>
         timestamp: ts,
         workspacePath: state.workspacePath ?? undefined,
         toolCalls: [],
+        fileEdits: [],
+        bashExecHints: [],
       };
     }
 

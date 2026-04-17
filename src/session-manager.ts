@@ -6,16 +6,34 @@
 
 import { similarity } from "@aidrift/core";
 import type { ApiClient } from "./api-client";
-import type { ParsedEntry } from "./watchers/jsonl-parser.js";
+import type { ParsedEntry, ParsedFileEdit, ExecStage } from "./watchers/jsonl-parser.js";
+
+interface PendingFileEdit extends ParsedFileEdit {
+  occurredAt: string;
+}
+
+interface ExecutionEvent {
+  stage: ExecStage;
+  status: "pass" | "fail";
+  createdAt: string;
+}
 
 interface PendingPair {
   userPromptText: string;
   userPromptUuid: string;
   assistantChunks: string[];
   toolCalls: string[];
+  fileEdits: PendingFileEdit[];
+  /** toolUseId → stage for bash commands that match lint/build/test. */
+  bashExecHints: Map<string, ExecStage>;
+  /** Execution events derived from pairing bash hints with tool results. */
+  executionEvents: ExecutionEvent[];
   model?: string;
   provider: "claude-code" | "codex";
   workspacePath?: string;
+  promptAt?: string;
+  replyStartedAt?: string;
+  replyCompletedAt?: string;
 }
 
 interface SessionDto {
@@ -94,6 +112,13 @@ export class SessionManager {
 
   getActiveTaskDescription(): string | null {
     return this.activeTaskDescription;
+  }
+
+  /** Returns the id of the most recently posted turn (any session). */
+  getLastTurnId(): string | null {
+    if (!this.activeSessionId) return null;
+    const last = this.lastTurn.get(this.activeSessionId);
+    return last?.id ?? null;
   }
 
   /** Clears the cached active session id (e.g. after the API returns 404 for it). */
@@ -190,7 +215,7 @@ export class SessionManager {
       return;
     }
 
-    const effectiveWorkspacePath = workspacePath ?? entry.workspacePath;
+    const effectiveWorkspacePath = workspacePath ?? ("workspacePath" in entry ? entry.workspacePath : undefined);
 
     if (entry.kind === "user-prompt") {
       // Bootstrap a session as soon as the first prompt is seen so tracking
@@ -219,9 +244,30 @@ export class SessionManager {
         userPromptUuid: entry.uuid,
         assistantChunks: [],
         toolCalls: [],
+        fileEdits: [],
+        bashExecHints: new Map(),
+        executionEvents: [],
         provider,
         workspacePath: effectiveWorkspacePath,
+        promptAt: entry.timestamp,
       });
+      return;
+    }
+
+    // tool-results: pair with previously-seen bash hints to derive pass/fail
+    if (entry.kind === "tool-results") {
+      const p = this.pending.get(entry.sessionHint);
+      if (!p) return;
+      for (const r of entry.results) {
+        const stage = p.bashExecHints.get(r.toolUseId);
+        if (!stage) continue;
+        p.executionEvents.push({
+          stage,
+          status: r.isError ? "fail" : "pass",
+          createdAt: entry.timestamp,
+        });
+        p.bashExecHints.delete(r.toolUseId);
+      }
       return;
     }
 
@@ -230,7 +276,19 @@ export class SessionManager {
     if (!p) return;
     if (entry.text) p.assistantChunks.push(entry.text);
     if (entry.toolCalls.length > 0) p.toolCalls.push(...entry.toolCalls);
+    if (entry.fileEdits.length > 0) {
+      for (const fe of entry.fileEdits) {
+        p.fileEdits.push({ ...fe, occurredAt: entry.timestamp });
+      }
+    }
+    for (const hint of entry.bashExecHints) {
+      p.bashExecHints.set(hint.toolUseId, hint.stage);
+    }
     if (entry.model) p.model = entry.model;
+    // First assistant chunk sets "reply started"; every chunk advances
+    // "reply completed" so the last one wins.
+    if (!p.replyStartedAt) p.replyStartedAt = entry.timestamp;
+    p.replyCompletedAt = entry.timestamp;
     // Debounced flush avoids waiting for the next user prompt before creating
     // the first tracked turn/session.
     this.schedulePendingFlush(entry.sessionHint);
@@ -278,13 +336,26 @@ export class SessionManager {
     const p = this.pending.get(sessionHint);
     if (!p) return;
     if (p.assistantChunks.length === 0 && p.toolCalls.length === 0) return;
-    const sessionId = await this.ensureSession(
-      sessionHint,
-      p.userPromptText,
-      p.provider,
-      p.workspacePath,
-    );
-    if (!sessionId) return; // belongs to another user
+    let sessionId: string | null;
+    try {
+      sessionId = await this.ensureSession(
+        sessionHint,
+        p.userPromptText,
+        p.provider,
+        p.workspacePath,
+      );
+    } catch (err) {
+      console.error("[aidrift] ensureSession in flush failed:", err);
+      // Don't delete the pending pair — a transient error should be retried
+      // on the next flush. But don't block the caller either.
+      return;
+    }
+    if (!sessionId) {
+      // belongs to another user — drop the pending pair so it doesn't
+      // accumulate forever.
+      this.pending.delete(sessionHint);
+      return;
+    }
     try {
       const turn = await this.api.request<{ id: string }>(`/sessions/${sessionId}/turns`, {
         method: "POST",
@@ -296,6 +367,16 @@ export class SessionManager {
             userPromptUuid: p.userPromptUuid,
             model: p.model,
             toolCalls: p.toolCalls,
+            timings: {
+              promptAt: p.promptAt,
+              replyStartedAt: p.replyStartedAt,
+              replyCompletedAt: p.replyCompletedAt,
+            },
+            aiDrift: {
+              ...(p.executionEvents.length > 0
+                ? { executionEvents: p.executionEvents }
+                : {}),
+            },
           },
         }),
       });
@@ -307,10 +388,37 @@ export class SessionManager {
         outcomeSettled: false,
       });
       this.unsettled.set(turn.id, { sessionId, postedAt: Date.now(), userPrompt: p.userPromptText });
+      // Fire-and-forget file-edits post; collision detection runs server-
+      // side. Failures are non-fatal: scoring / turn tracking already
+      // landed, this is supplementary signal.
+      if (p.fileEdits.length > 0) {
+        void this.postFileEdits(sessionId, turn.id, p.fileEdits);
+      }
     } catch (err) {
       console.error("[aidrift] failed to post turn:", err);
     }
     this.pending.delete(sessionHint);
+  }
+
+  private async postFileEdits(
+    sessionId: string,
+    turnId: string,
+    edits: PendingFileEdit[],
+  ): Promise<void> {
+    try {
+      await this.api.request(`/sessions/${sessionId}/turns/${turnId}/file-edits`, {
+        method: "POST",
+        body: JSON.stringify({
+          edits: edits.map((e) => ({
+            filePath: e.filePath,
+            editKind: e.editKind,
+            occurredAt: e.occurredAt,
+          })),
+        }),
+      });
+    } catch (err) {
+      console.error("[aidrift] failed to post file edits:", err);
+    }
   }
 
   /**

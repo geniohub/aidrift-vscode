@@ -2,7 +2,7 @@
   "name": "aidrift",
   "displayName": "AI Drift Detector",
   "description": "Watches your AI coding chats (Claude Code, Codex) and warns when sessions drift.",
-  "version": "0.0.10",
+  "version": "0.0.18",
   "publisher": "aidrift",
   "private": false,
   "engines": {
@@ -86,10 +86,25 @@
           "default": true,
           "description": "Watch ~/.codex/sessions/ for new OpenAI Codex rollouts and auto-track them."
         },
+        "aidrift.trackTaskExecution": {
+          "type": "boolean",
+          "default": true,
+          "description": "Report VSCode task and terminal shell outcomes (lint/build/test pass/fail) for the active turn so the Code Quality dashboard has data. Terminal coverage relies on VSCode shell integration (1.93+)."
+        },
+        "aidrift.watchGitEvents": {
+          "type": "boolean",
+          "default": true,
+          "description": "Watch .git/refs/ for commits and pushes. Displays git events in the session timeline and analytics dashboards."
+        },
         "aidrift.statusPollIntervalSeconds": {
           "type": "number",
           "default": 30,
-          "description": "How often the status bar polls /sessions/:id/status."
+          "description": "How often the status bar polls /sessions/:id/status. On repeated failures the interval grows exponentially (capped at 5 minutes) and resets on first success."
+        },
+        "aidrift.requestTimeoutSeconds": {
+          "type": "number",
+          "default": 10,
+          "description": "Timeout for HTTP requests from the extension to the AI Drift API. Requests that exceed this are aborted so a hung network doesn't wedge polling. Minimum 2 seconds."
         },
         "aidrift.driftAlertThreshold": {
           "type": "number",
@@ -111,6 +126,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit",
     "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node20 --minify",
     "package": "pnpm bundle && vsce package --no-dependencies",
     "watch": "tsc -p tsconfig.json --watch",

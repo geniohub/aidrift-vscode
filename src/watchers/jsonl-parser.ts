@@ -11,6 +11,11 @@ export interface ParsedUserPrompt {
   workspacePath?: string;
 }
 
+export interface ParsedFileEdit {
+  filePath: string;
+  editKind: "create" | "modify" | "delete";
+}
+
 export interface ParsedAssistantReply {
   kind: "assistant-reply";
   uuid: string;
@@ -27,6 +32,26 @@ export interface ParsedAssistantReply {
    * action repeated across turns).
    */
   toolCalls: string[];
+  /**
+   * Structured file edits extracted from Edit / Write / MultiEdit tool_use
+   * blocks. Only write-like operations land here — `read:` tool calls stay
+   * as fingerprints. Used by the collision detector (v1: file-only).
+   */
+  fileEdits: ParsedFileEdit[];
+  /**
+   * Bash tool_use blocks whose command matches lint/build/test. Paired with
+   * incoming tool_result entries by toolUseId to derive execution events for
+   * the Code Quality dashboard.
+   */
+  bashExecHints: BashExecHint[];
+}
+
+export type ExecStage = "lint" | "build" | "test";
+
+export interface BashExecHint {
+  toolUseId: string;
+  command: string;
+  stage: ExecStage;
 }
 
 export interface ParsedAiTitle {
@@ -35,14 +60,25 @@ export interface ParsedAiTitle {
   title: string;
 }
 
-export type ParsedEntry = ParsedUserPrompt | ParsedAssistantReply | ParsedAiTitle | { kind: "skip" };
+export interface ParsedToolResults {
+  kind: "tool-results";
+  sessionHint: string;
+  results: Array<{ toolUseId: string; isError: boolean }>;
+  timestamp: string;
+}
+
+export type ParsedEntry = ParsedUserPrompt | ParsedAssistantReply | ParsedAiTitle | ParsedToolResults | { kind: "skip" };
 
 interface ContentBlock {
   type: string;
   text?: string;
   thinking?: string;
   name?: string;
+  id?: string;
   input?: Record<string, unknown>;
+  tool_use_id?: string;
+  is_error?: boolean;
+  content?: string;
 }
 
 interface Message {
@@ -128,6 +164,74 @@ export function extractToolCalls(content: string | ContentBlock[] | undefined): 
   return out;
 }
 
+/**
+ * Extract structured file edits from an assistant message. Only write-like
+ * tools count: Edit / Write / MultiEdit / NotebookEdit. Read / Bash /
+ * Grep / Glob are observations, not edits. We don't parse line ranges
+ * (v1 is file-only); the collision detector only needs filePath + kind.
+ */
+export function extractFileEdits(content: string | ContentBlock[] | undefined): ParsedFileEdit[] {
+  if (!content || typeof content === "string" || !Array.isArray(content)) return [];
+  const out: ParsedFileEdit[] = [];
+  for (const block of content) {
+    if (block.type !== "tool_use") continue;
+    const name = block.name?.toLowerCase();
+    const input = block.input ?? {};
+    const filePath = typeof input.file_path === "string" ? input.file_path : null;
+    if (!filePath) continue;
+    switch (name) {
+      case "write":
+        out.push({ filePath, editKind: "create" });
+        break;
+      case "edit":
+      case "multiedit":
+      case "notebookedit":
+        out.push({ filePath, editKind: "modify" });
+        break;
+      default:
+        break;
+    }
+  }
+  return out;
+}
+
+const LINT_RE = /\b(lint|eslint|prettier|stylelint|biome)\b/i;
+const TEST_RE = /\b(test|vitest|jest|mocha|pytest|spec|cypress|playwright)\b/i;
+const BUILD_RE = /\b(build|compile|bundle|tsc|typecheck|type-check|webpack|vite|next|esbuild|rollup|turbo)\b/i;
+
+function classifyBashStage(command: string): ExecStage | null {
+  if (LINT_RE.test(command)) return "lint";
+  if (TEST_RE.test(command)) return "test";
+  if (BUILD_RE.test(command)) return "build";
+  return null;
+}
+
+export function extractBashExecHints(content: string | ContentBlock[] | undefined): BashExecHint[] {
+  if (!content || typeof content === "string" || !Array.isArray(content)) return [];
+  const out: BashExecHint[] = [];
+  for (const block of content) {
+    if (block.type !== "tool_use") continue;
+    const name = block.name?.toLowerCase();
+    if (name !== "bash") continue;
+    const command = typeof block.input?.command === "string" ? block.input.command : "";
+    const id = block.id;
+    if (!id || !command) continue;
+    const stage = classifyBashStage(command);
+    if (stage) out.push({ toolUseId: id, command, stage });
+  }
+  return out;
+}
+
+function extractToolResults(content: string | ContentBlock[] | undefined): Array<{ toolUseId: string; isError: boolean }> {
+  if (!content || typeof content === "string" || !Array.isArray(content)) return [];
+  const out: Array<{ toolUseId: string; isError: boolean }> = [];
+  for (const block of content) {
+    if (block.type !== "tool_result" || !block.tool_use_id) continue;
+    out.push({ toolUseId: block.tool_use_id, isError: block.is_error === true });
+  }
+  return out;
+}
+
 export function parseLine(line: string): ParsedEntry {
   if (!line.trim()) return { kind: "skip" };
   let raw: RawEntry;
@@ -172,14 +276,25 @@ export function parseLine(line: string): ParsedEntry {
     // "user" entries include real prompts AND tool_result injections.
     // Real prompts have text blocks; tool_results have type:"tool_result".
     const text = extractTextBlocks(raw.message?.content, ["text"]);
-    if (!text) return { kind: "skip" };
-    return {
-      kind: "user-prompt",
-      uuid: raw.uuid,
-      sessionHint: raw.sessionId,
-      text,
-      timestamp: raw.timestamp,
-    };
+    if (text) {
+      return {
+        kind: "user-prompt",
+        uuid: raw.uuid,
+        sessionHint: raw.sessionId,
+        text,
+        timestamp: raw.timestamp,
+      };
+    }
+    const toolResults = extractToolResults(raw.message?.content);
+    if (toolResults.length > 0) {
+      return {
+        kind: "tool-results",
+        sessionHint: raw.sessionId,
+        results: toolResults,
+        timestamp: raw.timestamp,
+      };
+    }
+    return { kind: "skip" };
   }
 
   if (raw.type === "assistant") {
@@ -188,6 +303,8 @@ export function parseLine(line: string): ParsedEntry {
     // bash-retry) that a pure-text similarity check can't see.
     const text = extractTextBlocks(raw.message?.content, ["text"]);
     const toolCalls = extractToolCalls(raw.message?.content);
+    const fileEdits = extractFileEdits(raw.message?.content);
+    const bashExecHints = extractBashExecHints(raw.message?.content);
     if (!text && toolCalls.length === 0) return { kind: "skip" };
     return {
       kind: "assistant-reply",
@@ -198,6 +315,8 @@ export function parseLine(line: string): ParsedEntry {
       model: raw.message?.model,
       parentUuid: raw.parentUuid,
       toolCalls,
+      fileEdits,
+      bashExecHints,
     };
   }
 

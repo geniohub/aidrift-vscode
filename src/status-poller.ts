@@ -1,9 +1,22 @@
 // Polls GET /sessions/:id/status for the active session and updates the
 // VSCode status bar. Fires a one-shot notification when a drift alert
 // first transitions to active.
+//
+// Resilience:
+// - Auth errors (401) and stale-session errors (404) are treated as signals,
+//   not failures, so they don't trigger backoff.
+// - Any other error (network, timeout, 5xx) applies exponential backoff up
+//   to BACKOFF_MAX_SEC, and on repeated failures we fall back to an
+//   unauthenticated /healthz probe so we can distinguish "API unreachable"
+//   from "signed out" or "no recent AI activity".
 
 import * as vscode from "vscode";
-import { ApiError, type ApiClient } from "./api-client";
+import { ApiError, NetworkError, type ApiClient } from "./api-client";
+
+const BACKOFF_MAX_SEC = 300;
+// After this many consecutive transport failures, probe /healthz to
+// confirm the API is actually down before we claim "offline" in the UI.
+const OFFLINE_CONFIRM_THRESHOLD = 2;
 
 interface StatusDto {
   session: { id: string; taskDescription: string };
@@ -45,6 +58,9 @@ export class StatusPoller {
   private lastAlertActive = false;
   private lastStatus: StatusDto | null = null;
   private lastTracking: TrackingHealthDto | null = null;
+  // Count of consecutive transport failures (network/timeout/5xx). Drives
+  // the exponential backoff on scheduleNext().
+  private consecutiveFailures = 0;
 
   constructor(
     private readonly api: ApiClient,
@@ -74,36 +90,44 @@ export class StatusPoller {
     return this.lastTracking;
   }
 
-  private scheduleNext(): void {
+  private baseIntervalSec(): number {
     const intervalSec = vscode.workspace
       .getConfiguration("aidrift")
       .get<number>("statusPollIntervalSeconds", 30);
-    this.timer = setTimeout(() => void this.tick(), Math.max(5, intervalSec) * 1000);
+    return Math.max(5, intervalSec);
+  }
+
+  private nextDelaySec(): number {
+    if (this.consecutiveFailures === 0) return this.baseIntervalSec();
+    // 1st failure: 2x. 2nd: 4x. 3rd: 8x. Capped at BACKOFF_MAX_SEC.
+    const shift = Math.min(this.consecutiveFailures, 4);
+    const delay = this.baseIntervalSec() * 2 ** shift;
+    return Math.min(delay, BACKOFF_MAX_SEC);
+  }
+
+  private scheduleNext(): void {
+    this.timer = setTimeout(() => void this.tick(), this.nextDelaySec() * 1000);
+  }
+
+  /** True for errors that indicate the transport is unhealthy (not a
+   * semantic signal like 401/404). Only these trigger backoff. */
+  private isTransportError(err: unknown): boolean {
+    if (err instanceof NetworkError) return true;
+    if (err instanceof ApiError && err.status >= 500) return true;
+    return false;
   }
 
   private async tick(): Promise<void> {
     try {
       const sessionId = this.getActiveSessionId();
       if (!sessionId) {
-        const task = this.getActiveTaskDescription();
         if (!(await this.api.isSignedIn())) {
-          this.statusBar.text = "$(account) Drift: sign in";
-          this.statusBar.command = "aidrift.login";
-          this.statusBar.tooltip = "Click to sign in to AI Drift";
-          this.statusBar.backgroundColor = undefined;
+          this.renderSignedOut();
         } else {
           const tracking = await this.fetchTrackingHealth();
-          const recent = tracking?.hasRecentActivity ?? false;
-          const idleLabel = formatIdleLabel(tracking?.lastTurnAt ?? null);
-          this.statusBar.text = recent
-            ? "$(pulse) Drift: watching"
-            : `$(warning) Drift: idle${idleLabel ? ` · ${idleLabel}` : ""}`;
-          this.statusBar.command = "aidrift.openActiveInDashboard";
-          this.statusBar.tooltip = this.trackingTooltip(tracking);
-          this.statusBar.backgroundColor = recent
-            ? undefined
-            : new vscode.ThemeColor("statusBarItem.warningBackground");
+          this.renderWatching(tracking);
         }
+        this.consecutiveFailures = 0;
         return;
       }
 
@@ -112,6 +136,7 @@ export class StatusPoller {
       this.lastStatus = status;
       this.render(status, tracking);
       this.maybeNotify(status);
+      this.consecutiveFailures = 0;
     } catch (err) {
       // 404 = stale active session id (e.g. it was deleted). Just clear the
       // status; don't pretend the API is down.
@@ -121,19 +146,78 @@ export class StatusPoller {
         this.statusBar.text = "$(pulse) Drift: watching";
         this.statusBar.tooltip = "Active session no longer exists.";
         this.statusBar.backgroundColor = undefined;
+        this.consecutiveFailures = 0;
       } else if (err instanceof ApiError && err.status === 401) {
         this.statusBar.text = "$(account) Drift: sign in";
         this.statusBar.command = "aidrift.login";
         this.statusBar.tooltip = "AI Drift session expired — sign in again.";
         this.statusBar.backgroundColor = undefined;
+        this.consecutiveFailures = 0;
+      } else if (this.isTransportError(err)) {
+        this.consecutiveFailures++;
+        await this.renderTransportFailure(err as Error);
       } else {
-        this.statusBar.text = "$(warning) Drift: api?";
-        this.statusBar.tooltip = `AI Drift API unreachable: ${(err as Error).message}`;
+        // Other ApiError (4xx other than 401/404) — unexpected but not a
+        // transport issue. Show it as-is without backoff.
+        this.statusBar.text = "$(warning) Drift: error";
+        this.statusBar.tooltip = `AI Drift API error: ${(err as Error).message}`;
         this.statusBar.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
       }
     } finally {
       this.scheduleNext();
     }
+  }
+
+  private renderSignedOut(): void {
+    this.statusBar.text = "$(account) Drift: sign in";
+    this.statusBar.command = "aidrift.login";
+    this.statusBar.tooltip = "Click to sign in to AI Drift";
+    this.statusBar.backgroundColor = undefined;
+  }
+
+  private renderWatching(tracking: TrackingHealthDto | null): void {
+    const recent = tracking?.hasRecentActivity ?? false;
+    const idleLabel = formatIdleLabel(tracking?.lastTurnAt ?? null);
+    // Connected in both branches — only the activity badge differs.
+    // "no AI activity" is deliberately explicit so users don't read "idle"
+    // as "the extension is disconnected".
+    this.statusBar.text = recent
+      ? "$(pulse) Drift: watching"
+      : `$(clock) Drift: no AI activity${idleLabel ? ` · ${idleLabel}` : ""}`;
+    this.statusBar.command = "aidrift.openActiveInDashboard";
+    this.statusBar.tooltip = this.trackingTooltip(tracking);
+    this.statusBar.backgroundColor = undefined;
+  }
+
+  /** After repeated transport failures, confirm the API is actually down
+   * (not just a glitch) via /healthz before claiming offline. If the
+   * probe succeeds we keep showing the last status we had — the next poll
+   * will pick up real data. */
+  private async renderTransportFailure(err: Error): Promise<void> {
+    const nextDelaySec = this.nextDelaySec();
+    if (this.consecutiveFailures >= OFFLINE_CONFIRM_THRESHOLD) {
+      const reachable = await this.api.ping();
+      if (!reachable) {
+        this.statusBar.text = "$(debug-disconnect) Drift: offline";
+        this.statusBar.tooltip =
+          `AI Drift API unreachable: ${err.message}\n` +
+          `Retrying in ${nextDelaySec}s.`;
+        this.statusBar.backgroundColor = new vscode.ThemeColor(
+          "statusBarItem.warningBackground",
+        );
+        return;
+      }
+      // API answers /healthz but the authed call didn't — likely a transient
+      // per-route 5xx. Reset the backoff so we stop slowing down.
+      this.consecutiveFailures = 0;
+    }
+    this.statusBar.text = "$(sync~spin) Drift: reconnecting";
+    this.statusBar.tooltip =
+      `AI Drift API temporarily unreachable: ${err.message}\n` +
+      `Retrying in ${nextDelaySec}s.`;
+    this.statusBar.backgroundColor = new vscode.ThemeColor(
+      "statusBarItem.warningBackground",
+    );
   }
 
   private render(status: StatusDto, tracking: TrackingHealthDto | null): void {
@@ -176,16 +260,15 @@ export class StatusPoller {
         : undefined;
   }
 
+  /** Propagates errors so the outer tick() catch can apply backoff on
+   * transport failures. We still update lastTracking only on success, so
+   * stale data is never silently returned. */
   private async fetchTrackingHealth(): Promise<TrackingHealthDto | null> {
-    try {
-      const workspace = this.getWorkspacePath();
-      const query = workspace ? `?workspacePath=${encodeURIComponent(workspace)}` : "";
-      const tracking = await this.api.request<TrackingHealthDto>(`/tracking/health${query}`);
-      this.lastTracking = tracking;
-      return tracking;
-    } catch {
-      return this.lastTracking;
-    }
+    const workspace = this.getWorkspacePath();
+    const query = workspace ? `?workspacePath=${encodeURIComponent(workspace)}` : "";
+    const tracking = await this.api.request<TrackingHealthDto>(`/tracking/health${query}`);
+    this.lastTracking = tracking;
+    return tracking;
   }
 
   private trackingTooltip(tracking: TrackingHealthDto | null): string {
