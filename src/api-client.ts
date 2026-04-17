@@ -1,17 +1,13 @@
-// Extension HTTP client. Tokens live in vscode.SecretStorage (OS keychain).
-// Auto-refreshes the access token on 401 and retries once. Also refreshes
-// proactively when the JWT is within REFRESH_AHEAD_MS of expiry so polling
-// doesn't wedge on a token that's about to die.
+// Extension HTTP client. Tokens live in vscode.SecretStorage (OS keychain),
+// scoped per profile (`aidrift.profile.<name>.*`). Active host + credentials
+// come from the ProfileManager. Auto-refreshes access tokens on 401 and
+// proactively if they're within REFRESH_AHEAD_MS of expiry so polling
+// doesn't wedge on a dying token.
 
 import * as vscode from "vscode";
-
-const ACCESS_KEY = "aidrift.accessToken";
-const REFRESH_KEY = "aidrift.refreshToken";
-const EMAIL_KEY = "aidrift.email";
-const PAT_KEY = "aidrift.pat";
+import type { ProfileManager } from "./profile-manager";
 
 const PING_TIMEOUT_MS = 5_000;
-// Refresh when the access token has less than this left.
 const REFRESH_AHEAD_MS = 120_000;
 
 export class ApiError extends Error {
@@ -46,11 +42,17 @@ interface AuthResponse {
 }
 
 export class ApiClient {
-  constructor(private readonly secrets: vscode.SecretStorage) {}
+  constructor(
+    private readonly secrets: vscode.SecretStorage,
+    private readonly profiles: ProfileManager,
+  ) {}
+
+  private key(kind: "accessToken" | "refreshToken" | "email" | "pat"): string {
+    return `aidrift.profile.${this.profiles.getActiveName()}.${kind}`;
+  }
 
   private apiBaseUrl(): string {
-    return vscode.workspace.getConfiguration("aidrift").get<string>("apiBaseUrl")
-      ?? "http://localhost:3330";
+    return this.profiles.getApiBaseUrl();
   }
 
   private requestTimeoutMs(): number {
@@ -79,11 +81,6 @@ export class ApiClient {
     }
   }
 
-  /**
-   * Unauthenticated liveness probe against /healthz. Used by the status
-   * poller to distinguish "API unreachable" from "signed out" or
-   * "no recent activity".
-   */
   async ping(): Promise<boolean> {
     try {
       const res = await this.fetchWithTimeout(
@@ -98,21 +95,20 @@ export class ApiClient {
   }
 
   async getEmail(): Promise<string | undefined> {
-    return this.secrets.get(EMAIL_KEY);
+    return this.secrets.get(this.key("email"));
   }
 
   async getAccess(): Promise<string | undefined> {
-    return this.secrets.get(ACCESS_KEY);
+    return this.secrets.get(this.key("accessToken"));
   }
 
   async isSignedIn(): Promise<boolean> {
-    return Boolean((await this.secrets.get(PAT_KEY)) || (await this.secrets.get(ACCESS_KEY)));
+    return Boolean(
+      (await this.secrets.get(this.key("pat"))) ||
+        (await this.secrets.get(this.key("accessToken"))),
+    );
   }
 
-  /**
-   * Sign in with a Personal Access Token minted from the dashboard. Probes
-   * /auth/me to confirm the token is valid before persisting.
-   */
   async loginWithToken(token: string): Promise<AuthResponse["user"]> {
     const res = await this.fetchWithTimeout(
       `${this.apiBaseUrl()}/auth/me`,
@@ -124,12 +120,10 @@ export class ApiClient {
       throw new ApiError(res.status, body.error ?? res.statusText);
     }
     const user = (await res.json()) as AuthResponse["user"];
-    await this.secrets.store(PAT_KEY, token);
-    await this.secrets.store(EMAIL_KEY, user.email);
-    // Token-based login is exclusive: clear any stale JWT pair so request()
-    // doesn't accidentally fall back to expired credentials.
-    await this.secrets.delete(ACCESS_KEY);
-    await this.secrets.delete(REFRESH_KEY);
+    await this.secrets.store(this.key("pat"), token);
+    await this.secrets.store(this.key("email"), user.email);
+    await this.secrets.delete(this.key("accessToken"));
+    await this.secrets.delete(this.key("refreshToken"));
     return user;
   }
 
@@ -148,30 +142,22 @@ export class ApiClient {
       throw new ApiError(res.status, body.error ?? res.statusText);
     }
     const data = (await res.json()) as AuthResponse;
-    await this.secrets.store(ACCESS_KEY, data.accessToken);
-    await this.secrets.store(REFRESH_KEY, data.refreshToken);
-    await this.secrets.store(EMAIL_KEY, data.user.email);
+    await this.secrets.store(this.key("accessToken"), data.accessToken);
+    await this.secrets.store(this.key("refreshToken"), data.refreshToken);
+    await this.secrets.store(this.key("email"), data.user.email);
+    await this.secrets.delete(this.key("pat"));
     return data.user;
   }
 
   async logout(): Promise<void> {
-    await this.secrets.delete(ACCESS_KEY);
-    await this.secrets.delete(REFRESH_KEY);
-    await this.secrets.delete(EMAIL_KEY);
-    await this.secrets.delete(PAT_KEY);
+    await this.secrets.delete(this.key("accessToken"));
+    await this.secrets.delete(this.key("refreshToken"));
+    await this.secrets.delete(this.key("email"));
+    await this.secrets.delete(this.key("pat"));
   }
 
-  /**
-   * Exchange the refresh token for a new access/refresh pair.
-   *
-   * `logoutOnFailure` should only be true on the reactive path (after a
-   * 401 confirmed the access token is dead). On the proactive path the
-   * current access token may still be valid for another ~2 minutes, so a
-   * transient refresh failure (network blip, server restart) should not
-   * kick the user out.
-   */
   private async tryRefresh(logoutOnFailure: boolean): Promise<boolean> {
-    const refreshToken = await this.secrets.get(REFRESH_KEY);
+    const refreshToken = await this.secrets.get(this.key("refreshToken"));
     if (!refreshToken) return false;
     try {
       const res = await this.fetchWithTimeout(
@@ -188,21 +174,16 @@ export class ApiClient {
         return false;
       }
       const data = (await res.json()) as AuthResponse;
-      await this.secrets.store(ACCESS_KEY, data.accessToken);
-      await this.secrets.store(REFRESH_KEY, data.refreshToken);
+      await this.secrets.store(this.key("accessToken"), data.accessToken);
+      await this.secrets.store(this.key("refreshToken"), data.refreshToken);
       return true;
     } catch {
       return false;
     }
   }
 
-  /**
-   * Refresh the access token if it's within REFRESH_AHEAD_MS of expiring.
-   * Best-effort: failures are swallowed; the caller will still send the
-   * request and fall back to the reactive 401 path if it really is dead.
-   */
   private async refreshIfExpiringSoon(): Promise<void> {
-    const access = await this.secrets.get(ACCESS_KEY);
+    const access = await this.secrets.get(this.key("accessToken"));
     if (!access) return;
     const expMs = decodeJwtExpMs(access);
     if (!expMs) return;
@@ -214,9 +195,9 @@ export class ApiClient {
     const headers = new Headers(init.headers);
     if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
 
-    const pat = await this.secrets.get(PAT_KEY);
+    const pat = await this.secrets.get(this.key("pat"));
     if (!pat) await this.refreshIfExpiringSoon();
-    const access = pat ?? (await this.secrets.get(ACCESS_KEY));
+    const access = pat ?? (await this.secrets.get(this.key("accessToken")));
     if (access) headers.set("Authorization", `Bearer ${access}`);
 
     const timeoutMs = this.requestTimeoutMs();
@@ -225,12 +206,10 @@ export class ApiClient {
       { ...init, headers },
       timeoutMs,
     );
-    // PATs don't refresh — on 401 we just surface the error so the user
-    // can re-paste a token. Only the JWT path attempts auto-refresh.
     if (res.status === 401 && !pat && access) {
       const ok = await this.tryRefresh(true);
       if (ok) {
-        const newAccess = await this.secrets.get(ACCESS_KEY);
+        const newAccess = await this.secrets.get(this.key("accessToken"));
         if (newAccess) headers.set("Authorization", `Bearer ${newAccess}`);
         res = await this.fetchWithTimeout(
           `${this.apiBaseUrl()}${path}`,

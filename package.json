@@ -2,7 +2,7 @@
   "name": "aidrift",
   "displayName": "AI Drift Detector",
   "description": "Watches your AI coding chats (Claude Code, Codex) and warns when sessions drift.",
-  "version": "0.0.18",
+  "version": "0.0.20",
   "publisher": "aidrift",
   "private": false,
   "engines": {
@@ -18,11 +18,13 @@
   "main": "./dist/extension.js",
   "files": [
     "dist/",
+    "media/",
     "README.md"
   ],
   "contributes": {
     "commands": [
       { "command": "aidrift.login", "title": "Drift: Sign In" },
+      { "command": "aidrift.loginWithBrowser", "title": "Drift: Sign In with Browser" },
       { "command": "aidrift.loginWithToken", "title": "Drift: Sign In with Token" },
       { "command": "aidrift.loginWithPassword", "title": "Drift: Sign In with Email + Password" },
       { "command": "aidrift.logout", "title": "Drift: Sign Out" },
@@ -35,7 +37,11 @@
       { "command": "aidrift.debugTracking", "title": "Drift: Debug Tracking" },
       { "command": "aidrift.openActiveInDashboard", "title": "Drift: Open Active Session in Dashboard" },
       { "command": "aidrift.openSessionInDashboard", "title": "Drift: Open Session in Dashboard" },
-      { "command": "aidrift.refreshSessions", "title": "Drift: Refresh Sessions", "icon": "$(refresh)" }
+      { "command": "aidrift.refreshSessions", "title": "Drift: Refresh Sessions", "icon": "$(refresh)" },
+      { "command": "aidrift.switchProfile", "title": "Drift: Switch Profile" },
+      { "command": "aidrift.addProfile", "title": "Drift: Add Profile" },
+      { "command": "aidrift.removeProfile", "title": "Drift: Remove Profile" },
+      { "command": "aidrift.showCurrentProfile", "title": "Drift: Show Current Profile" }
     ],
     "viewsContainers": {
       "activitybar": [
@@ -63,18 +69,61 @@
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "aidrift.sessions",
+        "when": "!aidrift.signedIn",
+        "contents": "Welcome to AI Drift — watch your AI coding chats for drift.\n\n[Sign in to AI Drift](command:aidrift.loginWithBrowser)\n\nOpens drift.geniohub.com in your browser. After signing in, the token is sent back to this editor automatically.\n\n[Other sign-in options](command:aidrift.login)\n\n[Switch profile](command:aidrift.switchProfile) to sign into a different host (e.g. local dev)."
+      }
+    ],
+    "walkthroughs": [
+      {
+        "id": "aidrift.getStarted",
+        "title": "Get Started with AI Drift",
+        "description": "Sign in and start tracking your AI coding sessions.",
+        "steps": [
+          {
+            "id": "aidrift.walkthrough.signIn",
+            "title": "Sign in to AI Drift",
+            "description": "Click the button below to open the AI Drift dashboard in your browser. After you sign in or sign up, the token is delivered back to this editor automatically — no copy-pasting.\n\n[Sign in via browser](command:aidrift.loginWithBrowser)",
+            "media": {
+              "markdown": "media/walkthrough-signin.md"
+            },
+            "completionEvents": [
+              "onContext:aidrift.signedIn"
+            ]
+          },
+          {
+            "id": "aidrift.walkthrough.switchProfile",
+            "title": "Switch between hosts (dev vs prod)",
+            "description": "AI Drift supports multiple named profiles. The default profile points at https://drift.geniohub.com. Add a local dev profile or switch between them from the status bar or the command palette.\n\n[Switch profile](command:aidrift.switchProfile)\n[Add profile](command:aidrift.addProfile)",
+            "media": {
+              "markdown": "media/walkthrough-profiles.md"
+            }
+          },
+          {
+            "id": "aidrift.walkthrough.done",
+            "title": "You're set",
+            "description": "AI Drift now watches Claude Code and Codex transcripts in your workspace. Open the AI Drift view in the activity bar to see live sessions and scores.\n\n[Show AI Drift view](command:workbench.view.extension.aidrift)",
+            "media": {
+              "markdown": "media/walkthrough-done.md"
+            }
+          }
+        ]
+      }
+    ],
     "configuration": {
       "title": "AI Drift Detector",
       "properties": {
         "aidrift.apiBaseUrl": {
           "type": "string",
-          "default": "http://localhost:3331/api",
-          "description": "AI Drift API base URL. Single public origin for all clients (dashboard, extension, CLI). In local dev this is the frontend container (which proxies /api/* to the api container). In SaaS deployment set this to e.g. https://aidrift.example.com/api."
+          "default": "https://drift.geniohub.com/api",
+          "description": "DEPRECATED — use 'Drift: Switch Profile' instead. This value is ignored once profiles are configured (the active profile's API URL wins)."
         },
         "aidrift.dashboardUrl": {
           "type": "string",
-          "default": "http://localhost:3331",
-          "description": "Dashboard URL opened by 'Drift: Open Active Session in Dashboard'."
+          "default": "https://drift.geniohub.com",
+          "description": "DEPRECATED — use profiles instead. The active profile's dashboard URL is used."
         },
         "aidrift.watchClaudeCode": {
           "type": "boolean",

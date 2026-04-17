@@ -145,28 +145,32 @@ async function openOneDiff(
   await vscode.commands.executeCommand("vscode.diff", left, right, title);
 }
 
-export interface DiffUriHandlerOptions {
+export interface UriHandlerOptions {
   workspaceRoots: () => string[];
+  onSignInCallback: (query: URLSearchParams) => Promise<void>;
 }
 
-export function registerDiffUriHandler(options: DiffUriHandlerOptions): vscode.Disposable {
+export function registerUriHandler(options: UriHandlerOptions): vscode.Disposable {
   return vscode.window.registerUriHandler({
     handleUri(uri: vscode.Uri): void {
-      // Supported path: /diff
-      if (uri.path !== "/diff") {
-        void vscode.window.showWarningMessage(`AI Drift: unknown URI path ${uri.path}`);
+      const params = new URLSearchParams(uri.query);
+      if (uri.path === "/diff") {
+        const fromSha = params.get("fromSha") ?? undefined;
+        const toSha = params.get("toSha") ?? undefined;
+        const filePath = params.get("filePath") ?? undefined;
+        void openDiffInVscode({
+          fromSha,
+          toSha,
+          filePath,
+          workspaceRoots: options.workspaceRoots(),
+        });
         return;
       }
-      const params = new URLSearchParams(uri.query);
-      const fromSha = params.get("fromSha") ?? undefined;
-      const toSha = params.get("toSha") ?? undefined;
-      const filePath = params.get("filePath") ?? undefined;
-      void openDiffInVscode({
-        fromSha,
-        toSha,
-        filePath,
-        workspaceRoots: options.workspaceRoots(),
-      });
+      if (uri.path === "/callback") {
+        void options.onSignInCallback(params);
+        return;
+      }
+      void vscode.window.showWarningMessage(`AI Drift: unknown URI path ${uri.path}`);
     },
   });
 }

@@ -11,7 +11,9 @@ import { StatusPoller } from "./status-poller";
 import { TaskWatcher } from "./task-watcher";
 import { GitWatcher } from "./watchers/git-watcher";
 import { SessionsTreeProvider } from "./views/sessions-tree";
-import { registerDiffUriHandler, openDiffInVscode } from "./diff-handler";
+import { registerUriHandler, openDiffInVscode } from "./diff-handler";
+import { ProfileManager, DEFAULT_API_URL, DEFAULT_DASHBOARD_URL } from "./profile-manager";
+import { BrowserSignIn } from "./browser-signin";
 
 const execFileAsync = promisify(execFile);
 
@@ -26,6 +28,8 @@ async function currentHeadSha(cwd: string): Promise<string | undefined> {
 
 let statusBar: vscode.StatusBarItem;
 let apiClient: ApiClient;
+let profiles: ProfileManager;
+let browserSignIn: BrowserSignIn;
 let sessionManager: SessionManager;
 let claudeWatcher: ClaudeCodeWatcher | undefined;
 let codexWatcher: CodexWatcher | undefined;
@@ -86,7 +90,14 @@ function claudeWorkspaceRootForFile(filePath: string): string | null | undefined
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   console.log(`[aidrift] activating v${VERSION}`);
-  apiClient = new ApiClient(context.secrets);
+  profiles = new ProfileManager(context);
+  await profiles.init();
+  context.subscriptions.push({ dispose: () => profiles.dispose() });
+
+  apiClient = new ApiClient(context.secrets, profiles);
+  browserSignIn = new BrowserSignIn(context, apiClient, profiles, async () => {
+    await refreshSignInState();
+  });
   sessionManager = new SessionManager(apiClient);
   sessionManager.start();
   context.subscriptions.push({ dispose: () => sessionManager.stop() });
@@ -115,6 +126,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   context.subscriptions.push(
     vscode.commands.registerCommand("aidrift.login", () => loginChooser()),
+    vscode.commands.registerCommand("aidrift.loginWithBrowser", () => browserSignIn.startSignIn()),
     vscode.commands.registerCommand("aidrift.loginWithToken", () => loginWithTokenFlow()),
     vscode.commands.registerCommand("aidrift.loginWithPassword", () => loginFlow()),
     vscode.commands.registerCommand("aidrift.logout", () => logoutFlow()),
@@ -128,6 +140,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("aidrift.openActiveInDashboard", () => openActiveInDashboard()),
     vscode.commands.registerCommand("aidrift.openSessionInDashboard", (sessionId?: string) => openSessionInDashboard(sessionId)),
     vscode.commands.registerCommand("aidrift.refreshSessions", () => treeProvider?.refresh()),
+    vscode.commands.registerCommand("aidrift.switchProfile", () => switchProfileFlow()),
+    vscode.commands.registerCommand("aidrift.addProfile", () => addProfileFlow()),
+    vscode.commands.registerCommand("aidrift.removeProfile", () => removeProfileFlow()),
+    vscode.commands.registerCommand("aidrift.showCurrentProfile", () => showCurrentProfileFlow()),
     vscode.commands.registerCommand(
       "aidrift.openDiff",
       (args: { fromSha?: string; toSha?: string; filePath?: string } | undefined) =>
@@ -140,15 +156,53 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ),
   );
   context.subscriptions.push(
-    registerDiffUriHandler({
+    registerUriHandler({
       workspaceRoots,
+      onSignInCallback: (params) => browserSignIn.handleCallback(params),
     }),
   );
+
+  // Rebuild watchers + tree whenever the user switches profiles.
+  profiles.onDidChange(async () => {
+    await stopWatchers();
+    sessionManager.reset();
+    treeProvider?.refresh();
+    updateStatusBar();
+    if (await apiClient.isSignedIn()) {
+      await startWatchers();
+    }
+  });
+
+  updateStatusBar();
+  await refreshSignInState();
 
   // Start the watcher if already signed in.
   if (await apiClient.isSignedIn()) {
     await startWatchers();
   }
+}
+
+async function refreshSignInState(): Promise<void> {
+  const signedIn = await apiClient.isSignedIn();
+  await vscode.commands.executeCommand("setContext", "aidrift.signedIn", signedIn);
+  updateStatusBar();
+  treeProvider?.refresh();
+  if (signedIn) {
+    await startWatchers();
+  }
+}
+
+function updateStatusBar(): void {
+  if (!statusBar || !profiles) return;
+  const name = profiles.getActiveName();
+  statusBar.text = `$(pulse) aidrift: ${name}`;
+  statusBar.tooltip = new vscode.MarkdownString(
+    `**AI Drift profile:** \`${name}\`\n\n` +
+      `API: ${profiles.getApiBaseUrl()}\n\n` +
+      `[Switch profile](command:aidrift.switchProfile)`,
+    true,
+  );
+  statusBar.command = "aidrift.switchProfile";
 }
 
 async function startWatchers(): Promise<void> {
@@ -237,7 +291,7 @@ async function loginFlow(): Promise<void> {
     }
     sessionManager.reset();
     void vscode.window.showInformationMessage(`Signed in to AI Drift as ${user.email}`);
-    await startWatchers();
+    await refreshSignInState();
   } catch (err) {
     const msg = err instanceof ApiError
       ? `Sign-in failed: ${err.message}`
@@ -249,13 +303,27 @@ async function loginFlow(): Promise<void> {
 async function loginChooser(): Promise<void> {
   const pick = await vscode.window.showQuickPick(
     [
-      { label: "Sign in with token", description: "Paste a Personal Access Token from the dashboard (works with Google accounts)", value: "token" },
-      { label: "Sign in with email + password", description: "Only works if you registered with a password", value: "password" },
+      {
+        label: "$(link-external) Sign in via browser",
+        description: "Open the dashboard, login or signup, token sent back automatically",
+        value: "browser",
+      },
+      {
+        label: "$(key) Sign in with token",
+        description: "Paste a Personal Access Token from the dashboard",
+        value: "token",
+      },
+      {
+        label: "$(account) Sign in with email + password",
+        description: "Only works if you registered with a password",
+        value: "password",
+      },
     ],
     { placeHolder: "How do you want to sign in to AI Drift?", ignoreFocusOut: true },
   );
   if (!pick) return;
-  if (pick.value === "token") await loginWithTokenFlow();
+  if (pick.value === "browser") await browserSignIn.startSignIn();
+  else if (pick.value === "token") await loginWithTokenFlow();
   else await loginFlow();
 }
 
@@ -275,7 +343,7 @@ async function loginWithTokenFlow(): Promise<void> {
     }
     sessionManager.reset();
     void vscode.window.showInformationMessage(`Signed in to AI Drift as ${user.email}`);
-    await startWatchers();
+    await refreshSignInState();
   } catch (err) {
     const msg = err instanceof ApiError
       ? `Token sign-in failed: ${err.message}`
@@ -288,6 +356,9 @@ async function logoutFlow(): Promise<void> {
   await apiClient.logout();
   await stopWatchers();
   sessionManager.reset();
+  await vscode.commands.executeCommand("setContext", "aidrift.signedIn", false);
+  treeProvider?.refresh();
+  updateStatusBar();
   void vscode.window.showInformationMessage("Signed out of AI Drift");
 }
 
@@ -433,7 +504,7 @@ function openActiveInDashboard(): void {
 }
 
 function openSessionInDashboard(sessionId?: string, hash?: string): void {
-  const base = vscode.workspace.getConfiguration("aidrift").get<string>("dashboardUrl") ?? "http://localhost:3331";
+  const base = profiles.getDashboardUrl();
   const workspacePath = firstWorkspaceRoot();
   const query = workspacePath ? `?workspacePath=${encodeURIComponent(workspacePath)}` : "";
   const fragment = hash ? `#${hash.replace(/^#/, "")}` : "";
@@ -457,6 +528,121 @@ function revertToLastCheckpoint(): void {
     return;
   }
   openSessionInDashboard(status.session.id, `turn-${cp.turnId}`);
+}
+
+// ---------- profile commands ----------
+
+async function switchProfileFlow(): Promise<void> {
+  const items = profiles.list().map((p) => ({
+    label: (p.active ? "$(check) " : "$(circle-outline) ") + p.name,
+    description: p.config.apiBaseUrl,
+    name: p.name,
+    alwaysShow: true,
+  }));
+  items.push({
+    label: "$(add) Add profile…",
+    description: "Create a new profile (host + user)",
+    name: "__add__",
+    alwaysShow: true,
+  });
+  const pick = await vscode.window.showQuickPick(items, {
+    placeHolder: "Select AI Drift profile",
+    ignoreFocusOut: true,
+  });
+  if (!pick) return;
+  if (pick.name === "__add__") {
+    await addProfileFlow();
+    return;
+  }
+  try {
+    await profiles.setActive(pick.name);
+    void vscode.window.showInformationMessage(
+      `AI Drift profile: ${pick.name} (${profiles.getApiBaseUrl()})`,
+    );
+  } catch (err) {
+    void vscode.window.showErrorMessage(`Switch failed: ${(err as Error).message}`);
+  }
+}
+
+async function addProfileFlow(): Promise<void> {
+  const name = await vscode.window.showInputBox({
+    prompt: "Profile name",
+    placeHolder: "e.g. dev, prod, staging",
+    ignoreFocusOut: true,
+    validateInput: (v) => (/^[a-zA-Z0-9_-]+$/.test(v) ? undefined : "letters, digits, _ or - only"),
+  });
+  if (!name) return;
+  const apiBaseUrl = await vscode.window.showInputBox({
+    prompt: "API base URL",
+    value: DEFAULT_API_URL,
+    ignoreFocusOut: true,
+  });
+  if (!apiBaseUrl) return;
+  const defaultDash = apiBaseUrl.replace(/\/api\/?$/, "") || DEFAULT_DASHBOARD_URL;
+  const dashboardUrl = await vscode.window.showInputBox({
+    prompt: "Dashboard URL (press Enter to accept)",
+    value: defaultDash,
+    ignoreFocusOut: true,
+  });
+  if (dashboardUrl === undefined) return;
+  try {
+    await profiles.add(name, { apiBaseUrl, dashboardUrl });
+    const switchNow = await vscode.window.showQuickPick(
+      [
+        { label: "Yes, switch now", value: true },
+        { label: "No, stay on current", value: false },
+      ],
+      { placeHolder: `Switch active profile to "${name}"?`, ignoreFocusOut: true },
+    );
+    if (switchNow?.value) {
+      await profiles.setActive(name);
+      void vscode.window.showInformationMessage(
+        `AI Drift profile: ${name}. Run 'Drift: Sign In' to authenticate.`,
+      );
+    }
+  } catch (err) {
+    void vscode.window.showErrorMessage(`Add profile failed: ${(err as Error).message}`);
+  }
+}
+
+async function removeProfileFlow(): Promise<void> {
+  const items = profiles.list()
+    .filter((p) => !p.active)
+    .map((p) => ({
+      label: p.name,
+      description: p.config.apiBaseUrl,
+      name: p.name,
+    }));
+  if (items.length === 0) {
+    void vscode.window.showWarningMessage("No other profiles to remove. Switch profiles first.");
+    return;
+  }
+  const pick = await vscode.window.showQuickPick(items, {
+    placeHolder: "Remove which profile?",
+    ignoreFocusOut: true,
+  });
+  if (!pick) return;
+  const confirm = await vscode.window.showWarningMessage(
+    `Remove profile "${pick.name}" and its stored credentials?`,
+    { modal: true },
+    "Remove",
+  );
+  if (confirm !== "Remove") return;
+  try {
+    await profiles.remove(pick.name);
+    void vscode.window.showInformationMessage(`Removed profile "${pick.name}".`);
+  } catch (err) {
+    void vscode.window.showErrorMessage(`Remove failed: ${(err as Error).message}`);
+  }
+}
+
+async function showCurrentProfileFlow(): Promise<void> {
+  const name = profiles.getActiveName();
+  const email = await apiClient.getEmail();
+  void vscode.window.showInformationMessage(
+    `AI Drift profile: ${name} (${profiles.getApiBaseUrl()})` +
+      (email ? ` — signed in as ${email}` : " — not signed in"),
+  );
 }
 
 export async function deactivate(): Promise<void> {
