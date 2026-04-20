@@ -33,6 +33,7 @@ export class CodexWatcher {
     this.watcher.on("ready", () => void this.ingestExistingFiles());
     this.watcher.on("add", (p) => void this.ingest(p));
     this.watcher.on("change", (p) => void this.ingest(p));
+    this.watcher.on("unlink", (p) => this.dropFileState(p));
   }
 
   async stop(): Promise<void> {
@@ -57,6 +58,7 @@ export class CodexWatcher {
     try {
       size = statSync(filePath).size;
     } catch {
+      this.dropFileState(filePath);
       return;
     }
     if (size <= start) {
@@ -122,5 +124,10 @@ export class CodexWatcher {
       }
     }
     return out;
+  }
+
+  private dropFileState(filePath: string): void {
+    this.offsets.delete(filePath);
+    this.parsers.delete(filePath);
   }
 }

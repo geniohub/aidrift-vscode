@@ -149,11 +149,11 @@ export class SessionsTreeProvider implements vscode.TreeDataProvider<SessionTree
       const query = workspacePath
         ? `&workspacePath=${encodeURIComponent(workspacePath)}`
         : "";
-      // User-configurable via `aidrift.sessionsLimit` (default 100). Anything
+      // User-configurable via `aidrift.sessionsLimit` (default 50). Anything
       // beyond this limit should be found via the "Drift: Search Sessions"
       // command (title-bar 🔍 icon), which searches titles + turn content
       // server-side.
-      const rawLimit = vscode.workspace.getConfiguration("aidrift").get<number>("sessionsLimit", 100);
+      const rawLimit = vscode.workspace.getConfiguration("aidrift").get<number>("sessionsLimit", 50);
       const limit = Math.min(500, Math.max(1, Math.floor(rawLimit)));
       let sessions = await this.api.request<SessionDto[]>(`/sessions?limit=${limit}${query}`);
       // Hard client-side filter: only show sessions matching this workspace.

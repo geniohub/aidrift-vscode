@@ -2,7 +2,7 @@
   "name": "aidrift",
   "displayName": "AI Drift Detector",
   "description": "Watches your AI coding chats (Claude Code, Codex) and warns when sessions drift.",
-  "version": "0.0.34",
+  "version": "0.0.36",
   "publisher": "GenioHub",
   "private": false,
   "icon": "media/icon.png",
@@ -262,7 +262,7 @@
         },
         "aidrift.sessionsLimit": {
           "type": "number",
-          "default": 100,
+          "default": 50,
           "minimum": 1,
           "maximum": 500,
           "description": "Maximum number of recent sessions to fetch for the AI Drift sidebar. Sessions are filtered to the current workspace after fetching, so the visible count may be lower. Use the sidebar's 🔍 Search Sessions command to find older sessions beyond this limit."

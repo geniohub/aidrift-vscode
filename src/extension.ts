@@ -417,8 +417,8 @@ async function setLastTurnOutcome(outcome: "accepted" | "rejected"): Promise<voi
     return;
   }
   try {
-    const turns = await apiClient.request<Array<{ id: string; turnIndex: number }>>(`/sessions/${sid}/turns`);
-    const last = turns.at(-1);
+    const turns = await apiClient.request<Array<{ id: string; turnIndex: number }>>(`/sessions/${sid}/turns?limit=1`);
+    const last = turns[0];
     if (!last) {
       void vscode.window.showWarningMessage("No turns in the active session yet.");
       return;
@@ -445,8 +445,8 @@ async function createCheckpointFlow(): Promise<void> {
   });
   if (!summary) return;
   try {
-    const turns = await apiClient.request<Array<{ id: string }>>(`/sessions/${sid}/turns`);
-    const last = turns.at(-1);
+    const turns = await apiClient.request<Array<{ id: string }>>(`/sessions/${sid}/turns?limit=1`);
+    const last = turns[0];
     if (!last) {
       void vscode.window.showWarningMessage("No turns yet.");
       return;

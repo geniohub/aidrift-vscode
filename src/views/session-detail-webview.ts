@@ -105,6 +105,7 @@ export class SessionDetailPanel {
   private readonly panel: vscode.WebviewPanel;
   private readonly disposables: vscode.Disposable[] = [];
   private pollTimer: NodeJS.Timeout | undefined;
+  private lastFetchedTurnCount: number | null = null;
   private data: PanelData = { status: null, turns: [], scores: [], commits: [], error: null };
 
   private constructor(
@@ -144,16 +145,25 @@ export class SessionDetailPanel {
     this.pollTimer = undefined;
   }
 
-  private async refresh(): Promise<void> {
+  private async refresh(forceTurns = false): Promise<void> {
     try {
-      const [status, turns, scores, commits] = await Promise.all([
+      const [status, scores, commits] = await Promise.all([
         this.deps.api.request<StatusDto>(`/sessions/${this.sessionId}/status`),
-        this.deps.api.request<TurnDto[]>(`/sessions/${this.sessionId}/turns`),
         this.deps.api.request<ScoreDto[]>(`/sessions/${this.sessionId}/scores?limit=200`),
         this.deps.api
           .request<GitEventDto[]>(`/sessions/${this.sessionId}/git-events`)
           .catch(() => [] as GitEventDto[]),
       ]);
+
+      const shouldRefreshTurns =
+        forceTurns ||
+        this.lastFetchedTurnCount === null ||
+        status.turnCount !== this.lastFetchedTurnCount;
+      const turns = shouldRefreshTurns
+        ? await this.deps.api.request<TurnDto[]>(`/sessions/${this.sessionId}/turns?limit=200`)
+        : this.data.turns;
+      if (shouldRefreshTurns) this.lastFetchedTurnCount = status.turnCount;
+
       this.data = { status, turns, scores, commits, error: null };
       if (status?.session?.taskDescription) {
         this.panel.title = shortTitle(status.session.taskDescription);
@@ -203,7 +213,7 @@ export class SessionDetailPanel {
         return;
       }
       case "refresh": {
-        await this.refresh();
+        await this.refresh(true);
         return;
       }
     }

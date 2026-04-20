@@ -251,9 +251,16 @@ export function extractFileEdits(content: string | ContentBlock[] | undefined): 
   return out;
 }
 
-const LINT_RE = /\b(lint|eslint|prettier|stylelint|biome)\b/i;
-const TEST_RE = /\b(test|vitest|jest|mocha|pytest|spec|cypress|playwright)\b/i;
-const BUILD_RE = /\b(build|compile|bundle|tsc|typecheck|type-check|webpack|vite|next|esbuild|rollup|turbo)\b/i;
+// Order matters: more-specific patterns (e.g. `npm run test`) must match before
+// a generic keyword like `build` in `npm run build`. We evaluate lint → test →
+// build so `cargo test` lands in TEST, `make test` lands in TEST, `make` alone
+// falls through to BUILD, etc.
+const LINT_RE =
+  /\b(lint|eslint|prettier|stylelint|biome|ruff|mypy|flake8|pylint|black|rubocop|shellcheck|gofmt|clippy|cargo\s+fmt|cargo\s+clippy)\b/i;
+const TEST_RE =
+  /\b(test|vitest|jest|mocha|pytest|spec|cypress|playwright|phpunit|rspec|go\s+test|cargo\s+test|bun\s+test|deno\s+test)\b/i;
+const BUILD_RE =
+  /\b(build|compile|bundle|tsc|typecheck|type-check|webpack|vite|next|esbuild|rollup|turbo|make|gradle|mvn|maven|sbt|go\s+build|go\s+vet|cargo\s+build|cargo\s+check|dotnet\s+build|bun\s+build)\b/i;
 
 function classifyBashStage(command: string): ExecStage | null {
   if (LINT_RE.test(command)) return "lint";

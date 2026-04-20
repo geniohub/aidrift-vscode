@@ -32,8 +32,8 @@ type SessionIdGetter = () => string | null;
 const DEBOUNCE_MS = 1500;
 
 export class GitWatcher {
-  private headWatcher: FSWatcher | undefined;
-  private remoteWatcher: FSWatcher | undefined;
+  private headWatchers: FSWatcher[] = [];
+  private remoteWatchers: FSWatcher[] = [];
   private debounceTimers = new Map<string, NodeJS.Timeout>();
   private lastHeadCommit = new Map<string, string>(); // branch → hash
   private lastRemoteCommit = new Map<string, string>(); // remote/branch → hash
@@ -48,6 +48,7 @@ export class GitWatcher {
   async start(): Promise<void> {
     const roots = this.workspaceRoots();
     if (roots.length === 0) return;
+    if (this.headWatchers.length > 0 || this.remoteWatchers.length > 0) return;
 
     for (const root of roots) {
       const gitDir = join(root, ".git");
@@ -57,36 +58,38 @@ export class GitWatcher {
       // Seed current HEAD so we don't fire on startup
       await this.seedCurrentHead(root);
 
-      this.headWatcher = chokidar.watch(headsDir, {
+      const headWatcher = chokidar.watch(headsDir, {
         persistent: true,
         ignoreInitial: true,
         followSymlinks: false,
       });
-      this.headWatcher.on("change", (filePath) => {
+      headWatcher.on("change", (filePath) => {
         this.debounce(`head:${filePath}`, () => void this.onHeadChange(root, filePath));
       });
-      this.headWatcher.on("add", (filePath) => {
+      headWatcher.on("add", (filePath) => {
         this.debounce(`head:${filePath}`, () => void this.onBranchCreate(root, filePath));
       });
+      this.headWatchers.push(headWatcher);
 
-      this.remoteWatcher = chokidar.watch(remotesDir, {
+      const remoteWatcher = chokidar.watch(remotesDir, {
         persistent: true,
         ignoreInitial: true,
         followSymlinks: false,
       });
-      this.remoteWatcher.on("change", (filePath) => {
+      remoteWatcher.on("change", (filePath) => {
         this.debounce(`remote:${filePath}`, () => void this.onRemoteChange(root, filePath));
       });
+      this.remoteWatchers.push(remoteWatcher);
     }
   }
 
   async stop(): Promise<void> {
     for (const t of this.debounceTimers.values()) clearTimeout(t);
     this.debounceTimers.clear();
-    await this.headWatcher?.close();
-    this.headWatcher = undefined;
-    await this.remoteWatcher?.close();
-    this.remoteWatcher = undefined;
+    for (const w of this.headWatchers) await w.close();
+    this.headWatchers = [];
+    for (const w of this.remoteWatchers) await w.close();
+    this.remoteWatchers = [];
   }
 
   private debounce(key: string, fn: () => void): void {

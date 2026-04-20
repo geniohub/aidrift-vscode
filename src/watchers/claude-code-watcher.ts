@@ -49,6 +49,9 @@ export class ClaudeCodeWatcher {
     this.watcher.on("change", (p) => {
       if (p.endsWith(".jsonl")) void this.ingest(p);
     });
+    this.watcher.on("unlink", (p) => {
+      if (p.endsWith(".jsonl")) this.offsets.delete(p);
+    });
 
     // FSEvents on macOS occasionally drops change notifications for files
     // under rapid append. A short polling sweep over files we've already seen
@@ -114,6 +117,7 @@ export class ClaudeCodeWatcher {
     try {
       size = statSync(filePath).size;
     } catch {
+      this.offsets.delete(filePath);
       return;
     }
     if (size <= start) {
