@@ -34,7 +34,7 @@ function shortWorkspace(wp: string | null): string {
   return parts.slice(-1)[0] ?? wp;
 }
 
-class SessionTreeItem extends vscode.TreeItem {
+export class SessionTreeItem extends vscode.TreeItem {
   constructor(
     public readonly session: SessionDto,
     score: ScoreDto | null,
@@ -78,8 +78,8 @@ class SessionTreeItem extends vscode.TreeItem {
       this.iconPath = new vscode.ThemeIcon("circle-outline");
     }
     this.command = {
-      command: "aidrift.openSessionInDashboard",
-      title: "Open in Dashboard",
+      command: "aidrift.openSessionWebview",
+      title: "Open Session",
       arguments: [session.id],
     };
   }
@@ -96,13 +96,22 @@ export class SessionsTreeProvider implements vscode.TreeDataProvider<SessionTree
   readonly onDidChangeTreeData = this._changeEmitter.event;
   private refreshTimer: NodeJS.Timeout | undefined;
   private wsListener: vscode.Disposable | undefined;
+  private cfgListener: vscode.Disposable | undefined;
+  private lastChildren: SessionTreeItem[] = [];
 
   constructor(private readonly api: ApiClient) {}
+
+  getItemById(sessionId: string): SessionTreeItem | undefined {
+    return this.lastChildren.find((item) => item.session?.id === sessionId);
+  }
 
   startAutoRefresh(intervalMs = 60_000): void {
     if (this.refreshTimer) return;
     this.refreshTimer = setInterval(() => this.refresh(), intervalMs);
     this.wsListener = vscode.workspace.onDidChangeWorkspaceFolders(() => this.refresh());
+    this.cfgListener = vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("aidrift.sessionsLimit")) this.refresh();
+    });
   }
 
   stopAutoRefresh(): void {
@@ -112,6 +121,8 @@ export class SessionsTreeProvider implements vscode.TreeDataProvider<SessionTree
     }
     this.wsListener?.dispose();
     this.wsListener = undefined;
+    this.cfgListener?.dispose();
+    this.cfgListener = undefined;
   }
 
   refresh(): void {
@@ -120,6 +131,10 @@ export class SessionsTreeProvider implements vscode.TreeDataProvider<SessionTree
 
   getTreeItem(element: SessionTreeItem): vscode.TreeItem {
     return element;
+  }
+
+  getParent(_element: SessionTreeItem): vscode.ProviderResult<SessionTreeItem> {
+    return undefined;
   }
 
   async getChildren(): Promise<SessionTreeItem[]> {
@@ -134,7 +149,13 @@ export class SessionsTreeProvider implements vscode.TreeDataProvider<SessionTree
       const query = workspacePath
         ? `&workspacePath=${encodeURIComponent(workspacePath)}`
         : "";
-      let sessions = await this.api.request<SessionDto[]>(`/sessions?limit=25${query}`);
+      // User-configurable via `aidrift.sessionsLimit` (default 100). Anything
+      // beyond this limit should be found via the "Drift: Search Sessions"
+      // command (title-bar 🔍 icon), which searches titles + turn content
+      // server-side.
+      const rawLimit = vscode.workspace.getConfiguration("aidrift").get<number>("sessionsLimit", 100);
+      const limit = Math.min(500, Math.max(1, Math.floor(rawLimit)));
+      let sessions = await this.api.request<SessionDto[]>(`/sessions?limit=${limit}${query}`);
       // Hard client-side filter: only show sessions matching this workspace.
       if (workspacePath) {
         sessions = sessions.filter((s) => s.workspacePath === workspacePath);
@@ -150,13 +171,15 @@ export class SessionsTreeProvider implements vscode.TreeDataProvider<SessionTree
         empty.iconPath = new vscode.ThemeIcon("info");
         return [empty as unknown as SessionTreeItem];
       }
-      return sessions.map((s) => {
+      const items = sessions.map((s) => {
         const score: ScoreDto | null =
           typeof s.currentScore === "number" && s.trend
             ? { score: s.currentScore, trend: s.trend }
             : null;
         return new SessionTreeItem(s, score, workspacePath);
       });
+      this.lastChildren = items;
+      return items;
     } catch (err) {
       const error = new vscode.TreeItem(`API error: ${(err as Error).message}`, vscode.TreeItemCollapsibleState.None);
       error.iconPath = new vscode.ThemeIcon("error");

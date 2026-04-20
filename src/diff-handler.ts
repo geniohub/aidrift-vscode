@@ -145,56 +145,10 @@ async function openOneDiff(
   await vscode.commands.executeCommand("vscode.diff", left, right, title);
 }
 
-// Open the AI Drift sidebar on the given session. If the session's workspace
-// isn't currently open in any folder, surface a soft toast that offers to
-// open it in a new window (so we don't clobber the user's current state).
-export interface OpenSessionArgs {
-  sessionId?: string;
-  workspacePath?: string;
-  currentWorkspaceRoots: string[];
-}
-
-export async function openSessionInVscode(args: OpenSessionArgs): Promise<void> {
-  const { sessionId, workspacePath, currentWorkspaceRoots } = args;
-  const targetOpen =
-    !!workspacePath &&
-    currentWorkspaceRoots.some((r) => r === workspacePath || r === workspacePath.replace(/\/+$/, ""));
-
-  if (workspacePath && !targetOpen) {
-    const pick = await vscode.window.showInformationMessage(
-      `AI Drift: open ${workspacePath} in a new VSCode window?`,
-      "Open",
-      "Not now",
-    );
-    if (pick === "Open") {
-      await vscode.commands.executeCommand(
-        "vscode.openFolder",
-        vscode.Uri.file(workspacePath),
-        { forceNewWindow: true },
-      );
-      return;
-    }
-    // User declined — still focus the sidebar in this window so they can at
-    // least see the list of sessions.
-  }
-
-  try {
-    await vscode.commands.executeCommand("workbench.view.extension.aidrift");
-  } catch {
-    /* sidebar not registered — non-fatal */
-  }
-
-  if (sessionId) {
-    void vscode.window.setStatusBarMessage(
-      `AI Drift: session …${sessionId.slice(-6)} focused`,
-      3000,
-    );
-  }
-}
-
 export interface UriHandlerOptions {
   workspaceRoots: () => string[];
   onSignInCallback: (query: URLSearchParams) => Promise<void>;
+  onOpenSession: (sessionId: string, workspacePath: string | undefined) => Promise<void>;
 }
 
 export function registerUriHandler(options: UriHandlerOptions): vscode.Disposable {
@@ -216,11 +170,11 @@ export function registerUriHandler(options: UriHandlerOptions): vscode.Disposabl
       if (uri.path === "/session") {
         const sessionId = params.get("id") ?? undefined;
         const workspacePath = params.get("workspacePath") ?? undefined;
-        void openSessionInVscode({
-          sessionId,
-          workspacePath,
-          currentWorkspaceRoots: options.workspaceRoots(),
-        });
+        if (!sessionId) {
+          void vscode.window.showWarningMessage("AI Drift: session link is missing the id param.");
+          return;
+        }
+        void options.onOpenSession(sessionId, workspacePath);
         return;
       }
       if (uri.path === "/callback") {
