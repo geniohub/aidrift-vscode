@@ -124,6 +124,7 @@ export function createCodexParser(initialHint: string | null): (line: string) =>
         toolCalls: [],
         fileEdits: [],
         bashExecHints: [],
+        agentSpawns: [],
       };
     }
 

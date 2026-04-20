@@ -44,6 +44,26 @@ export interface ParsedAssistantReply {
    * the Code Quality dashboard.
    */
   bashExecHints: BashExecHint[];
+  /**
+   * Agent/Task sub-agent spawns extracted from this assistant message. Each
+   * entry is one `Task`/`Agent` tool_use block. The session manager uses
+   * these to: (1) post spawn ledger rows, and (2) match incoming child
+   * sessions by prompt-prefix hash.
+   */
+  agentSpawns: ParsedAgentSpawn[];
+}
+
+/**
+ * One Agent/Task tool_use from Claude Code. `prompt` is the sub-agent's
+ * stated purpose — the same string Claude Code injects as the sub-agent's
+ * first user prompt, which is how we later match an orphan JSONL to its
+ * parent. Guard both `task` and `agent` tool names for version robustness.
+ */
+export interface ParsedAgentSpawn {
+  toolUseId: string;
+  agentType: string | null;
+  description: string | null;
+  prompt: string;
 }
 
 export type ExecStage = "lint" | "build" | "test";
@@ -63,7 +83,7 @@ export interface ParsedAiTitle {
 export interface ParsedToolResults {
   kind: "tool-results";
   sessionHint: string;
-  results: Array<{ toolUseId: string; isError: boolean }>;
+  results: Array<{ toolUseId: string; isError: boolean; textPreview?: string }>;
   timestamp: string;
 }
 
@@ -78,7 +98,7 @@ interface ContentBlock {
   input?: Record<string, unknown>;
   tool_use_id?: string;
   is_error?: boolean;
-  content?: string;
+  content?: string | ContentBlock[];
 }
 
 interface Message {
@@ -149,9 +169,45 @@ export function fingerprintToolUse(block: ContentBlock): string | null {
       return pattern ? `grep:${norm(pattern)}` : null;
     case "glob":
       return pattern ? `glob:${norm(pattern)}` : null;
+    case "task":
+    case "agent": {
+      const promptRaw = typeof input.prompt === "string" ? input.prompt : null;
+      return promptRaw ? `task:${norm(promptRaw)}` : null;
+    }
     default:
       return null;
   }
+}
+
+/**
+ * Extract Agent/Task sub-agent spawns from an assistant message. Guards
+ * both tool names — Claude Code has shifted between `Task` and `Agent`
+ * across builds — so we stay robust.
+ */
+export function extractAgentSpawns(
+  content: string | ContentBlock[] | undefined,
+): ParsedAgentSpawn[] {
+  if (!content || typeof content === "string" || !Array.isArray(content)) return [];
+  const out: ParsedAgentSpawn[] = [];
+  for (const block of content) {
+    if (block.type !== "tool_use") continue;
+    const name = block.name?.toLowerCase();
+    if (name !== "task" && name !== "agent") continue;
+    const id = block.id;
+    const input = block.input ?? {};
+    const prompt = typeof input.prompt === "string" ? input.prompt : null;
+    if (!id || !prompt) continue;
+    const description =
+      typeof input.description === "string" ? input.description : null;
+    const agentType =
+      typeof input.subagent_type === "string"
+        ? input.subagent_type
+        : typeof input.agent_type === "string"
+          ? input.agent_type
+          : null;
+    out.push({ toolUseId: id, agentType, description, prompt });
+  }
+  return out;
 }
 
 export function extractToolCalls(content: string | ContentBlock[] | undefined): string[] {
@@ -222,12 +278,34 @@ export function extractBashExecHints(content: string | ContentBlock[] | undefine
   return out;
 }
 
-function extractToolResults(content: string | ContentBlock[] | undefined): Array<{ toolUseId: string; isError: boolean }> {
+const TOOL_RESULT_PREVIEW_CHARS = 2048;
+
+function extractToolResults(
+  content: string | ContentBlock[] | undefined,
+): Array<{ toolUseId: string; isError: boolean; textPreview?: string }> {
   if (!content || typeof content === "string" || !Array.isArray(content)) return [];
-  const out: Array<{ toolUseId: string; isError: boolean }> = [];
+  const out: Array<{ toolUseId: string; isError: boolean; textPreview?: string }> = [];
   for (const block of content) {
     if (block.type !== "tool_result" || !block.tool_use_id) continue;
-    out.push({ toolUseId: block.tool_use_id, isError: block.is_error === true });
+    // Preserve the result text (trimmed) so the session-manager can archive
+    // it on an AgentSpawn ledger row. Matching up to an Agent spawn happens
+    // upstream; we always extract the preview (cheap) and let the consumer
+    // decide whether to keep it.
+    const raw =
+      typeof block.content === "string"
+        ? block.content
+        : Array.isArray(block.content)
+          ? (block.content as ContentBlock[])
+              .map((b) => (b.type === "text" ? b.text : null))
+              .filter((x): x is string => !!x)
+              .join("\n")
+          : undefined;
+    const textPreview = raw ? raw.slice(0, TOOL_RESULT_PREVIEW_CHARS) : undefined;
+    out.push({
+      toolUseId: block.tool_use_id,
+      isError: block.is_error === true,
+      ...(textPreview ? { textPreview } : {}),
+    });
   }
   return out;
 }
@@ -305,6 +383,7 @@ export function parseLine(line: string): ParsedEntry {
     const toolCalls = extractToolCalls(raw.message?.content);
     const fileEdits = extractFileEdits(raw.message?.content);
     const bashExecHints = extractBashExecHints(raw.message?.content);
+    const agentSpawns = extractAgentSpawns(raw.message?.content);
     if (!text && toolCalls.length === 0) return { kind: "skip" };
     return {
       kind: "assistant-reply",
@@ -317,6 +396,7 @@ export function parseLine(line: string): ParsedEntry {
       toolCalls,
       fileEdits,
       bashExecHints,
+      agentSpawns,
     };
   }
 

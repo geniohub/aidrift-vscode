@@ -32,12 +32,20 @@ function connectUrl(dashboardUrl: string, state: string): string {
   return `${base}/connect/vscode?${params.toString()}`;
 }
 
+export interface AuthenticatedEvent {
+  /** The email currently stored in secrets BEFORE loginWithToken ran. Used
+   *  by the host to decide whether to wipe watcher/session-manager state
+   *  (which is tied to the previous user's session-hint → id mapping). */
+  previousEmail: string | undefined;
+  newEmail: string;
+}
+
 export class BrowserSignIn {
   constructor(
     private readonly ctx: vscode.ExtensionContext,
     private readonly apiClient: ApiClient,
     private readonly profiles: ProfileManager,
-    private readonly onAuthenticated: () => Promise<void> | void,
+    private readonly onAuthenticated: (event: AuthenticatedEvent) => Promise<void> | void,
   ) {}
 
   async startSignIn(): Promise<void> {
@@ -118,12 +126,16 @@ export class BrowserSignIn {
       }
     }
 
+    // Read the previous email BEFORE loginWithToken — it overwrites the
+    // stored email, and the host callback needs the before/after to decide
+    // whether the in-memory watcher/session-manager caches are now stale.
+    const previousEmail = await this.apiClient.getEmail();
     try {
       const user = await this.apiClient.loginWithToken(token.trim());
       void vscode.window.showInformationMessage(
         `Signed in to AI Drift as ${user.email} (profile: ${pending.profileName}).`,
       );
-      await this.onAuthenticated();
+      await this.onAuthenticated({ previousEmail, newEmail: user.email });
     } catch (err) {
       void vscode.window.showErrorMessage(
         `AI Drift: sign-in failed: ${(err as Error).message}`,

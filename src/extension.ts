@@ -95,7 +95,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push({ dispose: () => profiles.dispose() });
 
   apiClient = new ApiClient(context.secrets, profiles);
-  browserSignIn = new BrowserSignIn(context, apiClient, profiles, async () => {
+  browserSignIn = new BrowserSignIn(context, apiClient, profiles, async ({ previousEmail, newEmail }) => {
+    // Match the command-palette sign-in paths (loginFlow, loginWithTokenFlow):
+    // if the authenticated account changed, tear down the watchers so the
+    // fresh start replays every on-disk JSONL against the new user —
+    // otherwise previously-cached session-hint → id mappings would route
+    // new turns to the old user's sessions (→ 404s, "missing" sessions).
+    // Always reset() the session manager for the same reason.
+    if (previousEmail && previousEmail !== newEmail) {
+      await stopWatchers();
+    }
+    sessionManager.reset();
     await refreshSignInState();
   });
   sessionManager = new SessionManager(apiClient);
