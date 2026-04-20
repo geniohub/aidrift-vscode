@@ -2,7 +2,7 @@
   "name": "aidrift",
   "displayName": "AI Drift Detector",
   "description": "Watches your AI coding chats (Claude Code, Codex) and warns when sessions drift.",
-  "version": "0.0.30",
+  "version": "0.0.33",
   "publisher": "GenioHub",
   "private": false,
   "icon": "media/icon.png",
@@ -99,6 +99,10 @@
         "title": "Drift: Open Session in Dashboard"
       },
       {
+        "command": "aidrift.openSessionWebview",
+        "title": "Drift: Open Session in Editor"
+      },
+      {
         "command": "aidrift.refreshSessions",
         "title": "Drift: Refresh Sessions",
         "icon": "$(refresh)"
@@ -144,9 +148,14 @@
     "menus": {
       "view/title": [
         {
+          "command": "aidrift.searchSessions",
+          "when": "view == aidrift.sessions",
+          "group": "navigation@1"
+        },
+        {
           "command": "aidrift.refreshSessions",
           "when": "view == aidrift.sessions",
-          "group": "navigation"
+          "group": "navigation@2"
         }
       ]
     },
@@ -250,6 +259,13 @@
           "type": "number",
           "default": 300,
           "description": "Seconds without a follow-up before a turn is treated as implicitly accepted."
+        },
+        "aidrift.sessionsLimit": {
+          "type": "number",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 500,
+          "description": "Maximum number of recent sessions to fetch for the AI Drift sidebar. Sessions are filtered to the current workspace after fetching, so the visible count may be lower. Use the sidebar's 🔍 Search Sessions command to find older sessions beyond this limit."
         }
       }
     }

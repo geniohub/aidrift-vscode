@@ -10,8 +10,11 @@ import { SessionManager } from "./session-manager";
 import { StatusPoller } from "./status-poller";
 import { TaskWatcher } from "./task-watcher";
 import { GitWatcher } from "./watchers/git-watcher";
-import { SessionsTreeProvider } from "./views/sessions-tree";
+import { SessionsTreeProvider, type SessionTreeItem } from "./views/sessions-tree";
+import { runSessionSearch } from "./views/session-search";
 import { registerUriHandler, openDiffInVscode } from "./diff-handler";
+import { reconcileGitCommits } from "./git-reconciler";
+import { SessionDetailPanel } from "./views/session-detail-webview";
 import { ProfileManager, DEFAULT_API_URL, DEFAULT_DASHBOARD_URL } from "./profile-manager";
 import { BrowserSignIn } from "./browser-signin";
 
@@ -37,6 +40,7 @@ let taskWatcher: TaskWatcher | undefined;
 let gitWatcher: GitWatcher | undefined;
 let poller: StatusPoller | undefined;
 let treeProvider: SessionsTreeProvider | undefined;
+let treeView: vscode.TreeView<SessionTreeItem> | undefined;
 
 function normalizeWorkspacePath(p: string): string {
   return normalize(p).replace(/[\\\/]+$/, "");
@@ -128,9 +132,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push({ dispose: () => poller?.stop() });
 
   treeProvider = new SessionsTreeProvider(apiClient);
-  context.subscriptions.push(
-    vscode.window.registerTreeDataProvider("aidrift.sessions", treeProvider),
-  );
+  treeView = vscode.window.createTreeView<SessionTreeItem>("aidrift.sessions", {
+    treeDataProvider: treeProvider,
+    showCollapseAll: false,
+  });
+  context.subscriptions.push(treeView);
   treeProvider.startAutoRefresh();
   context.subscriptions.push({ dispose: () => treeProvider?.stopAutoRefresh() });
 
@@ -149,7 +155,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("aidrift.debugTracking", () => debugTrackingFlow()),
     vscode.commands.registerCommand("aidrift.openActiveInDashboard", () => openActiveInDashboard()),
     vscode.commands.registerCommand("aidrift.openSessionInDashboard", (sessionId?: string) => openSessionInDashboard(sessionId)),
+    vscode.commands.registerCommand("aidrift.openSessionWebview", (sessionId?: string) => {
+      if (!sessionId) return;
+      void openSessionInEditor(sessionId, undefined);
+    }),
     vscode.commands.registerCommand("aidrift.refreshSessions", () => treeProvider?.refresh()),
+    vscode.commands.registerCommand("aidrift.searchSessions", () => runSessionSearch(apiClient)),
     vscode.commands.registerCommand("aidrift.switchProfile", () => switchProfileFlow()),
     vscode.commands.registerCommand("aidrift.addProfile", () => addProfileFlow()),
     vscode.commands.registerCommand("aidrift.editProfile", () => editProfileFlow()),
@@ -170,6 +181,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerUriHandler({
       workspaceRoots,
       onSignInCallback: (params) => browserSignIn.handleCallback(params),
+      onOpenSession: (sessionId, workspacePath) => openSessionInEditor(sessionId, workspacePath),
     }),
   );
 
@@ -190,6 +202,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Start the watcher if already signed in.
   if (await apiClient.isSignedIn()) {
     await startWatchers();
+    // Fire-and-forget post-rewrite detection. If the user ran filter-branch,
+    // filter-repo, or an interactive rebase that rewrote history, the SHAs
+    // stored in GitEvent rows no longer exist on HEAD; the server remaps them
+    // by subject. Runs once per activation, per workspace root.
+    for (const root of workspaceRoots()) {
+      void reconcileGitCommits(apiClient, root);
+    }
   }
 }
 
@@ -512,6 +531,53 @@ async function debugTrackingFlow(): Promise<void> {
 
 function openActiveInDashboard(): void {
   openSessionInDashboard(sessionManager.getActiveSessionId() ?? undefined);
+}
+
+// Primary handler for "Open session in VSCode". Opens the session's workspace
+// folder if it isn't already open, reveals the session in the sidebar tree,
+// and pops a native webview panel with turns/commits/scores + resume actions.
+async function openSessionInEditor(sessionId: string, workspacePath: string | undefined): Promise<void> {
+  const targetOpen =
+    !!workspacePath &&
+    workspaceRoots().some((r) => r === workspacePath || r === workspacePath.replace(/\/+$/, ""));
+  if (workspacePath && !targetOpen) {
+    const pick = await vscode.window.showInformationMessage(
+      `AI Drift: open ${workspacePath} in a new VSCode window?`,
+      "Open",
+      "Not now",
+    );
+    if (pick === "Open") {
+      await vscode.commands.executeCommand(
+        "vscode.openFolder",
+        vscode.Uri.file(workspacePath),
+        { forceNewWindow: true },
+      );
+      return; // new window takes over — the URI will fire again there if launched from dashboard
+    }
+  }
+
+  SessionDetailPanel.show(sessionId, {
+    api: apiClient,
+    workspaceRoots,
+    dashboardUrl: () => profiles.getDashboardUrl(),
+    revealInSidebar: revealSessionInSidebar,
+  });
+}
+
+async function revealSessionInSidebar(sessionId: string): Promise<void> {
+  try {
+    await vscode.commands.executeCommand("workbench.view.extension.aidrift");
+  } catch {
+    /* sidebar not registered — non-fatal */
+  }
+  const item = treeProvider?.getItemById(sessionId);
+  if (item && treeView) {
+    try {
+      await treeView.reveal(item, { select: true, focus: false, expand: false });
+    } catch {
+      /* item not in view yet — tree may still be loading */
+    }
+  }
 }
 
 function openSessionInDashboard(sessionId?: string, hash?: string): void {
