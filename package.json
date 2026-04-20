@@ -2,14 +2,17 @@
   "name": "aidrift",
   "displayName": "AI Drift Detector",
   "description": "Watches your AI coding chats (Claude Code, Codex) and warns when sessions drift.",
-  "version": "0.0.24",
+  "version": "0.0.29",
   "publisher": "GenioHub",
   "private": false,
   "icon": "media/icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["AI", "Other"],
+  "categories": [
+    "AI",
+    "Other"
+  ],
   "keywords": [
     "ai",
     "claude",
@@ -28,7 +31,9 @@
   "bugs": {
     "url": "https://github.com/geniohub/AiDriftClient/issues"
   },
-  "activationEvents": ["onStartupFinished"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./dist/extension.js",
   "files": [
     "dist/",
@@ -37,26 +42,87 @@
   ],
   "contributes": {
     "commands": [
-      { "command": "aidrift.login", "title": "Drift: Sign In" },
-      { "command": "aidrift.loginWithBrowser", "title": "Drift: Sign In with Browser" },
-      { "command": "aidrift.loginWithToken", "title": "Drift: Sign In with Token" },
-      { "command": "aidrift.loginWithPassword", "title": "Drift: Sign In with Email + Password" },
-      { "command": "aidrift.logout", "title": "Drift: Sign Out" },
-      { "command": "aidrift.whoami", "title": "Drift: Show Signed-In User" },
-      { "command": "aidrift.acceptLastTurn", "title": "Drift: Mark Last Turn Accepted" },
-      { "command": "aidrift.rejectLastTurn", "title": "Drift: Mark Last Turn Rejected" },
-      { "command": "aidrift.createCheckpoint", "title": "Drift: Create Checkpoint for Active Session" },
-      { "command": "aidrift.revertToLastCheckpoint", "title": "Drift: Open Last Stable Checkpoint" },
-      { "command": "aidrift.showStatus", "title": "Drift: Show Status for Active Session" },
-      { "command": "aidrift.debugTracking", "title": "Drift: Debug Tracking" },
-      { "command": "aidrift.openActiveInDashboard", "title": "Drift: Open Active Session in Dashboard" },
-      { "command": "aidrift.openSessionInDashboard", "title": "Drift: Open Session in Dashboard" },
-      { "command": "aidrift.refreshSessions", "title": "Drift: Refresh Sessions", "icon": "$(refresh)" },
-      { "command": "aidrift.switchProfile", "title": "Drift: Switch Profile" },
-      { "command": "aidrift.addProfile", "title": "Drift: Add Profile" },
-      { "command": "aidrift.editProfile", "title": "Drift: Edit Profile" },
-      { "command": "aidrift.removeProfile", "title": "Drift: Remove Profile" },
-      { "command": "aidrift.showCurrentProfile", "title": "Drift: Show Current Profile" }
+      {
+        "command": "aidrift.login",
+        "title": "Drift: Sign In"
+      },
+      {
+        "command": "aidrift.loginWithBrowser",
+        "title": "Drift: Sign In with Browser"
+      },
+      {
+        "command": "aidrift.loginWithToken",
+        "title": "Drift: Sign In with Token"
+      },
+      {
+        "command": "aidrift.loginWithPassword",
+        "title": "Drift: Sign In with Email + Password"
+      },
+      {
+        "command": "aidrift.logout",
+        "title": "Drift: Sign Out"
+      },
+      {
+        "command": "aidrift.whoami",
+        "title": "Drift: Show Signed-In User"
+      },
+      {
+        "command": "aidrift.acceptLastTurn",
+        "title": "Drift: Mark Last Turn Accepted"
+      },
+      {
+        "command": "aidrift.rejectLastTurn",
+        "title": "Drift: Mark Last Turn Rejected"
+      },
+      {
+        "command": "aidrift.createCheckpoint",
+        "title": "Drift: Create Checkpoint for Active Session"
+      },
+      {
+        "command": "aidrift.revertToLastCheckpoint",
+        "title": "Drift: Open Last Stable Checkpoint"
+      },
+      {
+        "command": "aidrift.showStatus",
+        "title": "Drift: Show Status for Active Session"
+      },
+      {
+        "command": "aidrift.debugTracking",
+        "title": "Drift: Debug Tracking"
+      },
+      {
+        "command": "aidrift.openActiveInDashboard",
+        "title": "Drift: Open Active Session in Dashboard"
+      },
+      {
+        "command": "aidrift.openSessionInDashboard",
+        "title": "Drift: Open Session in Dashboard"
+      },
+      {
+        "command": "aidrift.refreshSessions",
+        "title": "Drift: Refresh Sessions",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "aidrift.switchProfile",
+        "title": "Drift: Switch Profile"
+      },
+      {
+        "command": "aidrift.addProfile",
+        "title": "Drift: Add Profile"
+      },
+      {
+        "command": "aidrift.editProfile",
+        "title": "Drift: Edit Profile"
+      },
+      {
+        "command": "aidrift.removeProfile",
+        "title": "Drift: Remove Profile"
+      },
+      {
+        "command": "aidrift.showCurrentProfile",
+        "title": "Drift: Show Current Profile"
+      }
     ],
     "viewsContainers": {
       "activitybar": [

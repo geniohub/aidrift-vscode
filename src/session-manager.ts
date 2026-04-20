@@ -5,8 +5,45 @@
 // shouldn't have to explicitly mark every turn).
 
 import { similarity } from "@aidrift/core";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import type { ApiClient } from "./api-client";
-import type { ParsedEntry, ParsedFileEdit, ExecStage } from "./watchers/jsonl-parser.js";
+import type {
+  ParsedEntry,
+  ParsedFileEdit,
+  ExecStage,
+  ParsedAgentSpawn,
+} from "./watchers/jsonl-parser.js";
+
+const execFileAsync = promisify(execFile);
+
+// Cache of workspacePath → remote URL (resolved or null). Sessions created from
+// the same workspace reuse the lookup; `git config` is cheap but called once
+// per hint and we don't want to fan out on chatter.
+const gitRepoUrlCache = new Map<string, Promise<string | null>>();
+
+async function readGitRepoUrl(workspacePath: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["config", "--get", "remote.origin.url"],
+      { cwd: workspacePath, timeout: 2000 },
+    );
+    const url = stdout.trim();
+    return url.length > 0 ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+function getGitRepoUrl(workspacePath: string | undefined): Promise<string | null> {
+  if (!workspacePath) return Promise.resolve(null);
+  const cached = gitRepoUrlCache.get(workspacePath);
+  if (cached) return cached;
+  const pending = readGitRepoUrl(workspacePath);
+  gitRepoUrlCache.set(workspacePath, pending);
+  return pending;
+}
 
 interface PendingFileEdit extends ParsedFileEdit {
   occurredAt: string;
@@ -28,6 +65,9 @@ interface PendingPair {
   bashExecHints: Map<string, ExecStage>;
   /** Execution events derived from pairing bash hints with tool results. */
   executionEvents: ExecutionEvent[];
+  /** Agent/Task tool_use blocks seen in this turn. Posted as spawn ledger
+   *  rows when the pending pair flushes so the parent turn id is known. */
+  agentSpawns: ParsedAgentSpawn[];
   model?: string;
   provider: "claude-code" | "codex";
   workspacePath?: string;
@@ -36,11 +76,27 @@ interface PendingPair {
   replyCompletedAt?: string;
 }
 
+/** An Agent/Task spawn that has been posted to the server but hasn't yet
+ *  been matched to a child session. Kept in an LRU keyed by the prompt
+ *  prefix — the sub-agent's first user prompt is the Agent call's prompt
+ *  argument verbatim, which is how we link. */
+interface PendingSpawn {
+  toolUseId: string;
+  parentSessionId: string;
+  promptPrefix: string;
+  createdAt: number;
+}
+
+const SPAWN_MATCH_WINDOW_MS = 60 * 1000;
+const SPAWN_PREFIX_LEN = 240;
+const MAX_PENDING_SPAWNS = 200;
+
 interface SessionDto {
   id: string;
   sessionHint: string | null;
   taskDescription: string;
   workspacePath: string | null;
+  gitRepoUrl?: string | null;
 }
 
 interface TurnSummary {
@@ -48,6 +104,13 @@ interface TurnSummary {
   userPrompt: string;
   postedAt: number; // ms since epoch
   outcomeSettled: boolean;
+}
+
+/** Stable key for matching an Agent/Task spawn's `prompt` to the sub-agent's
+ *  first user prompt. Claude Code injects the prompt verbatim, but whitespace
+ *  normalization + truncation protects against minor mangling. */
+function normalizeSpawnPrefix(text: string): string {
+  return text.replace(/\s+/g, " ").trim().slice(0, SPAWN_PREFIX_LEN);
 }
 
 const REJECT_PATTERNS = /\b(no|nope|wrong|incorrect|actually|instead|still|broken|try again|not what|doesn[''`]t\s+work|didn[''`]t\s+work|not working|that[''`]?s wrong)\b/i;
@@ -67,6 +130,15 @@ export class SessionManager {
   private readonly lastTurn = new Map<string, TurnSummary>();
   /** Recently-seen turn ids (with their session) for the acceptTimer sweep */
   private readonly unsettled = new Map<string, { sessionId: string; postedAt: number; userPrompt: string }>();
+  /** Most-recently-posted turn id per session id — used so spawn posting can
+   *  attach to the right parent turn without refetching the session. */
+  private readonly lastTurnIdByHint = new Map<string, string>();
+  /** Pending Agent/Task spawns, keyed by prompt-prefix hash. When a new
+   *  sub-agent session's first prompt matches one of these, we adopt the
+   *  orphan as a child. LRU-capped. */
+  private readonly pendingSpawns = new Map<string, PendingSpawn>();
+  /** Adopted sessionHints, so we don't re-try adoption on every prompt. */
+  private readonly adoptedHints = new Set<string>();
   private activeSessionId: string | null = null;
   private activeTaskDescription: string | null = null;
   private sweepTimer: NodeJS.Timeout | undefined;
@@ -102,6 +174,9 @@ export class SessionManager {
     this.pending.clear();
     this.lastTurn.clear();
     this.unsettled.clear();
+    this.lastTurnIdByHint.clear();
+    this.pendingSpawns.clear();
+    this.adoptedHints.clear();
     this.activeSessionId = null;
     this.activeTaskDescription = null;
   }
@@ -142,6 +217,22 @@ export class SessionManager {
     return session.id;
   }
 
+  // Fire-and-forget PATCH to fill Session.gitRepoUrl on a session created by
+  // an older extension version. Server-side only writes when the column is
+  // still null, so concurrent heals across devices can't stomp each other.
+  private async backfillGitRepoUrl(sessionId: string, workspacePath: string): Promise<void> {
+    try {
+      const url = await getGitRepoUrl(workspacePath);
+      if (!url) return;
+      await this.api.request<SessionDto>(`/sessions/${sessionId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ gitRepoUrl: url }),
+      });
+    } catch {
+      // Silent — this is a best-effort cosmetic fill, never block the user.
+    }
+  }
+
   private async findSessionByHint(sessionHint: string, workspacePath?: string): Promise<SessionDto | null> {
     const query = workspacePath ? `?workspacePath=${encodeURIComponent(workspacePath)}` : "";
     try {
@@ -163,9 +254,18 @@ export class SessionManager {
     if (cached === "__skip__") return null;
     if (cached) return cached;
     const existing = await this.findSessionByHint(sessionHint, workspacePath);
-    if (existing) return this.cacheSession(existing);
+    if (existing) {
+      // Self-heal: older extension versions (or create-by-cli) may have left
+      // gitRepoUrl null. Fill it once from the workspace's remote so GitHub
+      // links render in the dashboard.
+      if (!existing.gitRepoUrl && workspacePath) {
+        void this.backfillGitRepoUrl(existing.id, workspacePath);
+      }
+      return this.cacheSession(existing);
+    }
 
     const task = suggestedTask.slice(0, 200) || `${provider} session`;
+    const gitRepoUrl = await getGitRepoUrl(workspacePath);
     try {
       const created = await this.api.request<SessionDto>("/sessions", {
         method: "POST",
@@ -175,6 +275,7 @@ export class SessionManager {
           sessionHint,
           autoCheckpointEnabled: true,
           workspacePath,
+          ...(gitRepoUrl ? { gitRepoUrl } : {}),
         }),
       });
       return this.cacheSession(created);
@@ -247,26 +348,39 @@ export class SessionManager {
         fileEdits: [],
         bashExecHints: new Map(),
         executionEvents: [],
+        agentSpawns: [],
         provider,
         workspacePath: effectiveWorkspacePath,
         promptAt: entry.timestamp,
       });
+
+      // Sub-agent adoption: if this is the first user prompt of a new
+      // sessionHint AND it matches a recently-posted Agent spawn's prompt,
+      // adopt this session as a child of the spawning parent. Fire-and-
+      // forget — failure just leaves the session top-level.
+      void this.tryAdoptAsChild(entry.sessionHint, entry.text);
       return;
     }
 
-    // tool-results: pair with previously-seen bash hints to derive pass/fail
+    // tool-results: pair with previously-seen bash hints to derive pass/fail,
+    // and forward Agent/Task results to the spawn ledger.
     if (entry.kind === "tool-results") {
       const p = this.pending.get(entry.sessionHint);
       if (!p) return;
       for (const r of entry.results) {
         const stage = p.bashExecHints.get(r.toolUseId);
-        if (!stage) continue;
-        p.executionEvents.push({
-          stage,
-          status: r.isError ? "fail" : "pass",
-          createdAt: entry.timestamp,
-        });
-        p.bashExecHints.delete(r.toolUseId);
+        if (stage) {
+          p.executionEvents.push({
+            stage,
+            status: r.isError ? "fail" : "pass",
+            createdAt: entry.timestamp,
+          });
+          p.bashExecHints.delete(r.toolUseId);
+          continue;
+        }
+        // Not a bash result — if it matches a pending Agent spawn, patch the
+        // ledger row with the preview. Fire-and-forget; 404 = not ours.
+        void this.maybeCompleteSpawn(r.toolUseId, r.textPreview, r.isError);
       }
       return;
     }
@@ -284,6 +398,7 @@ export class SessionManager {
     for (const hint of entry.bashExecHints) {
       p.bashExecHints.set(hint.toolUseId, hint.stage);
     }
+    if (entry.agentSpawns.length > 0) p.agentSpawns.push(...entry.agentSpawns);
     if (entry.model) p.model = entry.model;
     // First assistant chunk sets "reply started"; every chunk advances
     // "reply completed" so the last one wins.
@@ -387,12 +502,20 @@ export class SessionManager {
         postedAt: Date.now(),
         outcomeSettled: false,
       });
+      this.lastTurnIdByHint.set(sessionHint, turn.id);
       this.unsettled.set(turn.id, { sessionId, postedAt: Date.now(), userPrompt: p.userPromptText });
       // Fire-and-forget file-edits post; collision detection runs server-
       // side. Failures are non-fatal: scoring / turn tracking already
       // landed, this is supplementary signal.
       if (p.fileEdits.length > 0) {
         void this.postFileEdits(sessionId, turn.id, p.fileEdits);
+      }
+      // Sub-agent spawns: record one AgentSpawn per Task/Agent tool_use. The
+      // ledger row is what later matches an orphan child JSONL. Non-fatal.
+      if (p.agentSpawns.length > 0) {
+        for (const spawn of p.agentSpawns) {
+          void this.postAgentSpawn(sessionId, turn.id, spawn);
+        }
       }
     } catch (err) {
       console.error("[aidrift] failed to post turn:", err);
@@ -418,6 +541,101 @@ export class SessionManager {
       });
     } catch (err) {
       console.error("[aidrift] failed to post file edits:", err);
+    }
+  }
+
+  private async postAgentSpawn(
+    parentSessionId: string,
+    parentTurnId: string,
+    spawn: ParsedAgentSpawn,
+  ): Promise<void> {
+    try {
+      await this.api.request(`/agent-spawns`, {
+        method: "POST",
+        body: JSON.stringify({
+          parentSessionId,
+          parentTurnId,
+          toolUseId: spawn.toolUseId,
+          agentType: spawn.agentType,
+          prompt: spawn.prompt,
+          description: spawn.description,
+        }),
+      });
+      // Remember the prompt prefix so we can adopt an orphan child later.
+      const key = normalizeSpawnPrefix(spawn.prompt);
+      if (this.pendingSpawns.size >= MAX_PENDING_SPAWNS) {
+        // LRU eviction: drop the oldest entry.
+        const oldestKey = this.pendingSpawns.keys().next().value;
+        if (oldestKey) this.pendingSpawns.delete(oldestKey);
+      }
+      this.pendingSpawns.set(key, {
+        toolUseId: spawn.toolUseId,
+        parentSessionId,
+        promptPrefix: key,
+        createdAt: Date.now(),
+      });
+    } catch (err) {
+      const e = err as { status?: number };
+      // 404/409 — parent turn disappeared or duplicate; not fatal.
+      if (e.status === 404 || e.status === 409) return;
+      console.error("[aidrift] failed to post agent spawn:", err);
+    }
+  }
+
+  private async maybeCompleteSpawn(
+    toolUseId: string,
+    resultPreview: string | undefined,
+    isError: boolean,
+  ): Promise<void> {
+    try {
+      await this.api.request(`/agent-spawns/${encodeURIComponent(toolUseId)}/complete`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          resultPreview: resultPreview ?? null,
+          resultIsError: isError,
+        }),
+      });
+    } catch (err) {
+      const e = err as { status?: number };
+      // 404 = not an Agent spawn (e.g. a Read/Bash tool_result). Silent.
+      if (e.status === 404) return;
+      console.error("[aidrift] failed to complete agent spawn:", err);
+    }
+  }
+
+  private async tryAdoptAsChild(sessionHint: string, firstPrompt: string): Promise<void> {
+    if (this.adoptedHints.has(sessionHint)) return;
+    const key = normalizeSpawnPrefix(firstPrompt);
+    const match = this.pendingSpawns.get(key);
+    if (!match) return;
+    // Proximity guard: don't adopt if the spawn was recorded long ago.
+    if (Date.now() - match.createdAt > SPAWN_MATCH_WINDOW_MS) {
+      this.pendingSpawns.delete(key);
+      return;
+    }
+    // Resolve the child session id (may not be cached yet — the user-prompt
+    // path bootstraps the session before calling us).
+    const childId = this.sessionBySH.get(sessionHint);
+    if (!childId || childId === "__skip__") return;
+    try {
+      await this.api.request(`/sessions/${childId}/adopt-as-child`, {
+        method: "POST",
+        body: JSON.stringify({
+          parentSessionId: match.parentSessionId,
+          spawnToolUseId: match.toolUseId,
+        }),
+      });
+      this.adoptedHints.add(sessionHint);
+      this.pendingSpawns.delete(key);
+    } catch (err) {
+      const e = err as { status?: number };
+      // 409 (already linked) or 404 (spawn gone) — stop trying for this hint.
+      if (e.status === 409 || e.status === 404) {
+        this.adoptedHints.add(sessionHint);
+        this.pendingSpawns.delete(key);
+        return;
+      }
+      console.error("[aidrift] adopt-as-child failed:", err);
     }
   }
 
