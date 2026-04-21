@@ -10,11 +10,13 @@ import type { ParsedEntry } from "./jsonl-parser.js";
 import { createCodexParser, sessionHintFromFilename } from "./codex-parser.js";
 
 export type CodexEntryHandler = (entry: ParsedEntry, filePath: string) => Promise<void>;
+const POLL_INTERVAL_MS = 4_000;
 
 export class CodexWatcher {
   private watcher: FSWatcher | undefined;
   private readonly offsets = new Map<string, number>();
   private readonly parsers = new Map<string, (line: string) => ParsedEntry>();
+  private pollTimer: NodeJS.Timeout | undefined;
   private readonly rootDir: string;
 
   constructor(private readonly onEntry: CodexEntryHandler) {
@@ -22,21 +24,32 @@ export class CodexWatcher {
   }
 
   async start(): Promise<void> {
-    this.watcher = chokidar.watch(`${this.rootDir}/**/rollout-*.jsonl`, {
+    this.watcher = chokidar.watch(this.rootDir, {
       persistent: true,
       // We perform our own deterministic initial scan on "ready" because
       // chokidar initial add events can be missed on some hosts.
       ignoreInitial: true,
       followSymlinks: false,
-      awaitWriteFinish: { stabilityThreshold: 150, pollInterval: 50 },
     });
     this.watcher.on("ready", () => void this.ingestExistingFiles());
-    this.watcher.on("add", (p) => void this.ingest(p));
-    this.watcher.on("change", (p) => void this.ingest(p));
-    this.watcher.on("unlink", (p) => this.dropFileState(p));
+    this.watcher.on("add", (p) => {
+      if (isRolloutFilePath(p)) void this.ingest(p, true);
+    });
+    this.watcher.on("change", (p) => {
+      if (isRolloutFilePath(p)) void this.ingest(p);
+    });
+    this.watcher.on("unlink", (p) => {
+      if (isRolloutFilePath(p)) this.dropFileState(p);
+    });
+    // FSEvents can occasionally miss rapid append notifications.
+    this.pollTimer = setInterval(() => void this.sweep(), POLL_INTERVAL_MS);
   }
 
   async stop(): Promise<void> {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = undefined;
+    }
     await this.watcher?.close();
     this.watcher = undefined;
     this.offsets.clear();
@@ -52,8 +65,9 @@ export class CodexWatcher {
     return parser;
   }
 
-  private async ingest(filePath: string): Promise<void> {
-    const start = this.offsets.get(filePath) ?? 0;
+  private async ingest(filePath: string, initial = false): Promise<void> {
+    const prior = this.offsets.get(filePath);
+    const start = initial && prior === undefined ? 0 : prior ?? 0;
     let size: number;
     try {
       size = statSync(filePath).size;
@@ -65,27 +79,25 @@ export class CodexWatcher {
       this.offsets.set(filePath, size);
       return;
     }
+    const next = await this.readRange(filePath, start, size);
+    this.offsets.set(filePath, next);
+  }
+
+  private async readRange(filePath: string, start: number, end: number): Promise<number> {
     const parser = this.getParser(filePath);
-    const stream = createReadStream(filePath, { start, end: size - 1, encoding: "utf8" });
-    let buffered = "";
-    for await (const chunk of stream) {
-      buffered += chunk as string;
-      let newlineIdx: number;
-      while ((newlineIdx = buffered.indexOf("\n")) !== -1) {
-        const line = buffered.slice(0, newlineIdx);
-        buffered = buffered.slice(newlineIdx + 1);
-        const entry = parser(line);
-        if (entry.kind !== "skip") {
-          try {
-            await this.onEntry(entry, filePath);
-          } catch (err) {
-            console.error("[aidrift] codex onEntry threw:", err);
-          }
-        }
-      }
-    }
-    if (buffered.trim().length > 0) {
-      const entry = parser(buffered);
+    // Read as bytes and only consume complete newline-terminated lines.
+    const stream = createReadStream(filePath, { start, end: end - 1 });
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) chunks.push(chunk as Buffer);
+    const data = Buffer.concat(chunks);
+    const lastNewline = data.lastIndexOf(0x0a); // '\n'
+    if (lastNewline === -1) return start; // wait for a complete line
+
+    const processable = data.subarray(0, lastNewline).toString("utf8");
+    const lines = processable.split("\n");
+    for (const line of lines) {
+      if (!line) continue;
+      const entry = parser(line);
       if (entry.kind !== "skip") {
         try {
           await this.onEntry(entry, filePath);
@@ -94,14 +106,20 @@ export class CodexWatcher {
         }
       }
     }
-    this.offsets.set(filePath, size);
+    return start + lastNewline + 1;
+  }
+
+  private async sweep(): Promise<void> {
+    for (const p of this.offsets.keys()) {
+      await this.ingest(p);
+    }
   }
 
   private async ingestExistingFiles(): Promise<void> {
     const files = await this.listRolloutFiles(this.rootDir);
     files.sort();
     for (const filePath of files) {
-      await this.ingest(filePath);
+      await this.ingest(filePath, true);
     }
   }
 
@@ -119,7 +137,7 @@ export class CodexWatcher {
         out.push(...(await this.listRolloutFiles(full)));
         continue;
       }
-      if (entry.isFile() && basename(entry.name).startsWith("rollout-") && entry.name.endsWith(".jsonl")) {
+      if (entry.isFile() && isRolloutFilePath(full)) {
         out.push(full);
       }
     }
@@ -130,4 +148,9 @@ export class CodexWatcher {
     this.offsets.delete(filePath);
     this.parsers.delete(filePath);
   }
+}
+
+function isRolloutFilePath(path: string): boolean {
+  const name = basename(path);
+  return name.startsWith("rollout-") && name.endsWith(".jsonl");
 }
