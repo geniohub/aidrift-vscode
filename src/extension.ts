@@ -85,12 +85,20 @@ function claudeProjectSlugFromFile(filePath: string): string | undefined {
   return slug;
 }
 
+// Return semantics:
+//   string    — ingest and tag the session with this workspace root.
+//   null      — ingest, but no workspace root available (no roots open, or the
+//               jsonl's project slug doesn't match any open root — e.g. user
+//               launched `claude` from AiDrift while the VSCode window is
+//               rooted elsewhere). Server-side dedup on (userId, sessionHint)
+//               keeps a second window from creating duplicates.
+//   undefined — skip entirely (slug couldn't be derived; defensive).
 function claudeWorkspaceRootForFile(filePath: string): string | null | undefined {
   const roots = workspaceRoots();
   if (roots.length === 0) return null;
   const slug = claudeProjectSlugFromFile(filePath);
   if (!slug) return undefined;
-  return roots.find((root) => claudeProjectSlugFromWorkspacePath(root) === slug);
+  return roots.find((root) => claudeProjectSlugFromWorkspacePath(root) === slug) ?? null;
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -161,6 +169,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (!sessionId) return;
       void openSessionInEditor(sessionId, undefined);
     }),
+    vscode.commands.registerCommand("aidrift.rescanClaudeHistory", () => rescanClaudeHistoryFlow()),
     vscode.commands.registerCommand("aidrift.refreshSessions", () => treeProvider?.refresh()),
     vscode.commands.registerCommand("aidrift.searchSessions", () => runSessionSearch(apiClient)),
     vscode.commands.registerCommand("aidrift.switchProfile", () => switchProfileFlow()),
@@ -504,6 +513,24 @@ function showStatusFlow(): void {
   void vscode.window.showInformationMessage(
     `${status.session.taskDescription} — score ${status.currentScore ?? "—"} (${status.trend})${alertLine}`,
   );
+}
+
+async function rescanClaudeHistoryFlow(): Promise<void> {
+  if (!claudeWatcher) {
+    void vscode.window.showWarningMessage(
+      "AI Drift: Claude Code watcher is not running — sign in and enable it first.",
+    );
+    return;
+  }
+  try {
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: "AI Drift: rescanning Claude Code history…" },
+      () => claudeWatcher!.rescanFromScratch(),
+    );
+    void vscode.window.showInformationMessage("AI Drift: rescan complete.");
+  } catch (err) {
+    void vscode.window.showErrorMessage(`AI Drift rescan failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 async function debugTrackingFlow(): Promise<void> {

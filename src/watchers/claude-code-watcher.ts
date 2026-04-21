@@ -130,6 +130,18 @@ export class ClaudeCodeWatcher {
     this.offsets.clear();
   }
 
+  /**
+   * Drop all byte offsets (in-memory + persisted) and re-walk every JSONL
+   * from byte 0. Server-side dedup on (sessionId, userPromptUuid) keeps the
+   * replay idempotent. Used by the `aidrift.rescanClaudeHistory` command to
+   * recover sessions that a prior (buggy) extension version dropped silently.
+   */
+  async rescanFromScratch(): Promise<void> {
+    this.offsets.clear();
+    this.persistence?.save({});
+    await this.ingestExistingFiles();
+  }
+
   private async sweep(): Promise<void> {
     // Re-ingest known files for missed change notifications, AND rediscover
     // new files chokidar didn't fire "add" for. macOS FSEvents occasionally
