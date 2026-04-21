@@ -4,13 +4,13 @@ VSCode extension that watches your Claude Code and OpenAI Codex chats and warns 
 
 ## What it does
 
-- Auto-detects new Claude Code transcripts at `~/.claude/projects/**/*.jsonl` and Codex rollouts at `~/.codex/sessions/**/rollout-*.jsonl`
+- Auto-detects new Claude Code transcripts
 - Creates a drift session per chat tab and posts turns as they happen
 - Live status bar showing the active profile; click it to switch profiles
 - Notification with actions when drift is detected
 - Sidebar list of recent sessions (AI Drift activity-bar view)
 - Reports VSCode task and terminal outcomes (lint/build/test pass/fail) for the active turn
-- Watches `.git/refs/` for commits and pushes and attaches them to the session timeline
+- Watches git for commits and pushes and attaches them to the session timeline
 
 ## Install
 
