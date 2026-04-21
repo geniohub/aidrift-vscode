@@ -2,7 +2,7 @@
   "name": "aidrift",
   "displayName": "AI Drift Detector",
   "description": "Watches your AI coding chats (Claude Code, Codex) and warns when sessions drift.",
-  "version": "0.0.41",
+  "version": "0.0.42",
   "publisher": "GenioHub",
   "private": false,
   "icon": "media/icon.png",
