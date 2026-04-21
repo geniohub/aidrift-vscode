@@ -4,7 +4,7 @@ import { normalize } from "node:path";
 import { promisify } from "node:util";
 import { VERSION } from "@aidrift/core";
 import { ApiClient, ApiError } from "./api-client";
-import { ClaudeCodeWatcher } from "./watchers/claude-code-watcher";
+import { ClaudeCodeWatcher, type WatcherPersistence } from "./watchers/claude-code-watcher";
 import { CodexWatcher } from "./watchers/codex-watcher";
 import { SessionManager } from "./session-manager";
 import { StatusPoller } from "./status-poller";
@@ -34,6 +34,7 @@ let apiClient: ApiClient;
 let profiles: ProfileManager;
 let browserSignIn: BrowserSignIn;
 let sessionManager: SessionManager;
+let extensionContext: vscode.ExtensionContext;
 let claudeWatcher: ClaudeCodeWatcher | undefined;
 let codexWatcher: CodexWatcher | undefined;
 let taskWatcher: TaskWatcher | undefined;
@@ -94,6 +95,7 @@ function claudeWorkspaceRootForFile(filePath: string): string | null | undefined
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   console.log(`[aidrift] activating v${VERSION}`);
+  extensionContext = context;
   profiles = new ProfileManager(context);
   await profiles.init();
   context.subscriptions.push({ dispose: () => profiles.dispose() });
@@ -235,14 +237,34 @@ function updateStatusBar(): void {
   statusBar.command = "aidrift.switchProfile";
 }
 
+// Per-watcher byte-offset persistence. Stored in globalState so an extension
+// reload skips re-walking every JSONL from byte 0 (the server-side dedup on
+// userPromptUuid handles correctness even without this; persistence just
+// saves the redundant parse + HTTP roundtrips).
+function makeWatcherPersistence(key: string): WatcherPersistence | undefined {
+  if (!extensionContext) return undefined;
+  return {
+    load: () => {
+      const stored = extensionContext.globalState.get<Record<string, number>>(key);
+      return stored ?? {};
+    },
+    save: (offsets: Record<string, number>) => {
+      void extensionContext.globalState.update(key, offsets);
+    },
+  };
+}
+
 async function startWatchers(): Promise<void> {
   const cfg = vscode.workspace.getConfiguration("aidrift");
   if (!claudeWatcher && cfg.get<boolean>("watchClaudeCode", true)) {
-    claudeWatcher = new ClaudeCodeWatcher((entry, filePath) => {
-      const workspacePath = claudeWorkspaceRootForFile(filePath);
-      if (workspacePath === undefined) return Promise.resolve();
-      return sessionManager.handleEntry(entry, "claude-code", workspacePath ?? undefined);
-    });
+    claudeWatcher = new ClaudeCodeWatcher(
+      (entry, filePath) => {
+        const workspacePath = claudeWorkspaceRootForFile(filePath);
+        if (workspacePath === undefined) return Promise.resolve();
+        return sessionManager.handleEntry(entry, "claude-code", workspacePath ?? undefined);
+      },
+      makeWatcherPersistence("aidrift.watcher.claude.offsets"),
+    );
     try {
       await claudeWatcher.start();
       console.log("[aidrift] Claude Code watcher started");
@@ -252,11 +274,14 @@ async function startWatchers(): Promise<void> {
     }
   }
   if (!codexWatcher && cfg.get<boolean>("watchCodex", true)) {
-    codexWatcher = new CodexWatcher((entry) => {
-      const workspacePath = (entry.kind === "skip" || entry.kind === "ai-title" || entry.kind === "tool-results") ? undefined : entry.workspacePath;
-      if (!isInActiveWorkspace(workspacePath)) return Promise.resolve();
-      return sessionManager.handleEntry(entry, "codex", workspacePath);
-    });
+    codexWatcher = new CodexWatcher(
+      (entry) => {
+        const workspacePath = (entry.kind === "skip" || entry.kind === "ai-title" || entry.kind === "tool-results") ? undefined : entry.workspacePath;
+        if (!isInActiveWorkspace(workspacePath)) return Promise.resolve();
+        return sessionManager.handleEntry(entry, "codex", workspacePath);
+      },
+      makeWatcherPersistence("aidrift.watcher.codex.offsets"),
+    );
     try {
       await codexWatcher.start();
       console.log("[aidrift] Codex watcher started");

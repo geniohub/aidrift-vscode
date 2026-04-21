@@ -10,16 +10,43 @@ import { parseLine, type ParsedEntry } from "./jsonl-parser.js";
 
 export type ClaudeEntryHandler = (entry: ParsedEntry, filePath: string) => Promise<void>;
 
+export interface WatcherPersistence {
+  load(): Record<string, number>;
+  save(offsets: Record<string, number>): void;
+}
+
 const POLL_INTERVAL_MS = 4_000;
+const OFFSET_SAVE_DEBOUNCE_MS = 1_500;
 
 export class ClaudeCodeWatcher {
   private watcher: FSWatcher | undefined;
   private offsets = new Map<string, number>();
   private pollTimer: NodeJS.Timeout | undefined;
+  private saveTimer: NodeJS.Timeout | undefined;
   private readonly rootDir: string;
 
-  constructor(private readonly onEntry: ClaudeEntryHandler) {
+  constructor(
+    private readonly onEntry: ClaudeEntryHandler,
+    private readonly persistence?: WatcherPersistence,
+  ) {
     this.rootDir = join(homedir(), ".claude", "projects");
+    // Hydrate from globalState so a VSCode reload doesn't re-walk every JSONL
+    // from byte 0. Server-side dedup catches duplicates, but this saves the
+    // redundant parse + HTTP round-trips.
+    if (persistence) {
+      for (const [path, offset] of Object.entries(persistence.load())) {
+        this.offsets.set(path, offset);
+      }
+    }
+  }
+
+  private schedulePersist(): void {
+    if (!this.persistence) return;
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = undefined;
+      this.persistence?.save(Object.fromEntries(this.offsets));
+    }, OFFSET_SAVE_DEBOUNCE_MS);
   }
 
   async start(): Promise<void> {
@@ -91,14 +118,31 @@ export class ClaudeCodeWatcher {
       clearInterval(this.pollTimer);
       this.pollTimer = undefined;
     }
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = undefined;
+      // Flush pending offsets before teardown so the next activation picks
+      // up where we left off.
+      this.persistence?.save(Object.fromEntries(this.offsets));
+    }
     await this.watcher?.close();
     this.watcher = undefined;
     this.offsets.clear();
   }
 
   private async sweep(): Promise<void> {
-    const paths = [...this.offsets.keys()];
-    for (const p of paths) {
+    // Re-ingest known files for missed change notifications, AND rediscover
+    // new files chokidar didn't fire "add" for. macOS FSEvents occasionally
+    // drops add-events for newly-created JSONLs, which would otherwise leave
+    // a freshly-started Claude Code chat permanently unindexed.
+    const known = new Set(this.offsets.keys());
+    const found = await this.listJsonlFiles(this.rootDir);
+    for (const p of found) {
+      if (!known.has(p)) {
+        await this.ingest(p, true);
+      }
+    }
+    for (const p of known) {
       await this.ingest(p);
     }
   }
@@ -118,14 +162,17 @@ export class ClaudeCodeWatcher {
       size = statSync(filePath).size;
     } catch {
       this.offsets.delete(filePath);
+      this.schedulePersist();
       return;
     }
     if (size <= start) {
       this.offsets.set(filePath, size);
+      this.schedulePersist();
       return;
     }
     const next = await this.readRange(filePath, start, size);
     this.offsets.set(filePath, next);
+    this.schedulePersist();
   }
 
   private async readRange(filePath: string, start: number, end: number): Promise<number> {

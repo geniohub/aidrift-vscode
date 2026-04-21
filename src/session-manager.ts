@@ -249,6 +249,7 @@ export class SessionManager {
     suggestedTask: string,
     provider: "claude-code" | "codex",
     workspacePath?: string,
+    startedAtHint?: string,
   ): Promise<string | null> {
     const cached = this.sessionBySH.get(sessionHint);
     if (cached === "__skip__") return null;
@@ -276,6 +277,10 @@ export class SessionManager {
           autoCheckpointEnabled: true,
           workspacePath,
           ...(gitRepoUrl ? { gitRepoUrl } : {}),
+          // Pin the session's startedAt to the first prompt's timestamp so
+          // re-ingesting an old JSONL doesn't stamp it as "now" and reshuffle
+          // the recent-sessions list.
+          ...(startedAtHint ? { startedAt: startedAtHint } : {}),
         }),
       });
       return this.cacheSession(created);
@@ -331,6 +336,7 @@ export class SessionManager {
           entry.text,
           provider,
           effectiveWorkspacePath,
+          entry.timestamp,
         );
         if (!sid) return; // belongs to another user
         this.activeSessionId = sid;
@@ -462,6 +468,7 @@ export class SessionManager {
         p.userPromptText,
         p.provider,
         p.workspacePath,
+        p.promptAt,
       );
     } catch (err) {
       console.error("[aidrift] ensureSession in flush failed:", err);
@@ -481,6 +488,11 @@ export class SessionManager {
         body: JSON.stringify({
           userPrompt: p.userPromptText,
           modelResponse: p.assistantChunks.join("\n\n"),
+          // Top-level: server uses promptAt to stamp Turn.createdAt (preserving
+          // original chat order across re-ingests) and userPromptUuid to dedup
+          // a re-ingested turn instead of inserting a duplicate.
+          ...(p.promptAt ? { promptAt: p.promptAt } : {}),
+          userPromptUuid: p.userPromptUuid,
           metadata: {
             source: `${p.provider}-jsonl`,
             userPromptUuid: p.userPromptUuid,

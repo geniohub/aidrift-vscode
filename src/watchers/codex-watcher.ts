@@ -8,19 +8,39 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { ParsedEntry } from "./jsonl-parser.js";
 import { createCodexParser, sessionHintFromFilename } from "./codex-parser.js";
+import type { WatcherPersistence } from "./claude-code-watcher.js";
 
 export type CodexEntryHandler = (entry: ParsedEntry, filePath: string) => Promise<void>;
 const POLL_INTERVAL_MS = 4_000;
+const OFFSET_SAVE_DEBOUNCE_MS = 1_500;
 
 export class CodexWatcher {
   private watcher: FSWatcher | undefined;
   private readonly offsets = new Map<string, number>();
   private readonly parsers = new Map<string, (line: string) => ParsedEntry>();
   private pollTimer: NodeJS.Timeout | undefined;
+  private saveTimer: NodeJS.Timeout | undefined;
   private readonly rootDir: string;
 
-  constructor(private readonly onEntry: CodexEntryHandler) {
+  constructor(
+    private readonly onEntry: CodexEntryHandler,
+    private readonly persistence?: WatcherPersistence,
+  ) {
     this.rootDir = join(homedir(), ".codex", "sessions");
+    if (persistence) {
+      for (const [path, offset] of Object.entries(persistence.load())) {
+        this.offsets.set(path, offset);
+      }
+    }
+  }
+
+  private schedulePersist(): void {
+    if (!this.persistence) return;
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = undefined;
+      this.persistence?.save(Object.fromEntries(this.offsets));
+    }, OFFSET_SAVE_DEBOUNCE_MS);
   }
 
   async start(): Promise<void> {
@@ -50,6 +70,11 @@ export class CodexWatcher {
       clearInterval(this.pollTimer);
       this.pollTimer = undefined;
     }
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = undefined;
+      this.persistence?.save(Object.fromEntries(this.offsets));
+    }
     await this.watcher?.close();
     this.watcher = undefined;
     this.offsets.clear();
@@ -73,14 +98,17 @@ export class CodexWatcher {
       size = statSync(filePath).size;
     } catch {
       this.dropFileState(filePath);
+      this.schedulePersist();
       return;
     }
     if (size <= start) {
       this.offsets.set(filePath, size);
+      this.schedulePersist();
       return;
     }
     const next = await this.readRange(filePath, start, size);
     this.offsets.set(filePath, next);
+    this.schedulePersist();
   }
 
   private async readRange(filePath: string, start: number, end: number): Promise<number> {
@@ -110,7 +138,17 @@ export class CodexWatcher {
   }
 
   private async sweep(): Promise<void> {
-    for (const p of this.offsets.keys()) {
+    // Also rediscover files chokidar didn't fire "add" for — macOS FSEvents
+    // sometimes drops events on the deeply-nested date subdirs Codex rolls
+    // over into daily, which would leave today's new rollout unindexed.
+    const known = new Set(this.offsets.keys());
+    const found = await this.listRolloutFiles(this.rootDir);
+    for (const p of found) {
+      if (!known.has(p)) {
+        await this.ingest(p, true);
+      }
+    }
+    for (const p of known) {
       await this.ingest(p);
     }
   }
