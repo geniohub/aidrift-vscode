@@ -9,6 +9,50 @@ import type { ProfileManager } from "./profile-manager";
 
 const PING_TIMEOUT_MS = 5_000;
 const REFRESH_AHEAD_MS = 120_000;
+// Cap outbound concurrency so a burst (e.g. history re-ingest, heavy turn
+// with many tool_results) can't detonate the server's rate limit in one shot.
+// Picked conservatively: the API's global bucket is 3000/min per user, and
+// 4 in-flight requests are plenty for the watcher's sequential ingest path.
+const MAX_CONCURRENT_REQUESTS = 4;
+const RATE_LIMIT_MAX_RETRIES = 3;
+const RATE_LIMIT_DEFAULT_DELAY_MS = 1_000;
+const RATE_LIMIT_MAX_DELAY_MS = 30_000;
+
+let inFlight = 0;
+const waiters: Array<() => void> = [];
+
+async function acquireSlot(): Promise<void> {
+  if (inFlight < MAX_CONCURRENT_REQUESTS) {
+    inFlight += 1;
+    return;
+  }
+  await new Promise<void>((resolve) => waiters.push(resolve));
+  inFlight += 1;
+}
+
+function releaseSlot(): void {
+  inFlight -= 1;
+  const next = waiters.shift();
+  if (next) next();
+}
+
+function parseRetryAfterMs(res: Response, body: unknown): number {
+  const header = res.headers.get("retry-after");
+  if (header) {
+    const secs = Number(header);
+    if (Number.isFinite(secs) && secs >= 0) return Math.min(secs * 1000, RATE_LIMIT_MAX_DELAY_MS);
+  }
+  if (body && typeof body === "object") {
+    const rec = body as { retryAfterSeconds?: unknown };
+    const secs = typeof rec.retryAfterSeconds === "number" ? rec.retryAfterSeconds : NaN;
+    if (Number.isFinite(secs) && secs >= 0) return Math.min(secs * 1000, RATE_LIMIT_MAX_DELAY_MS);
+  }
+  return RATE_LIMIT_DEFAULT_DELAY_MS;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
@@ -216,33 +260,43 @@ export class ApiClient {
     if (access) headers.set("Authorization", `Bearer ${access}`);
 
     const timeoutMs = this.requestTimeoutMs();
-    let res = await this.fetchWithTimeout(
-      `${this.apiBaseUrl()}${path}`,
-      { ...init, headers },
-      timeoutMs,
-    );
-    if (res.status === 401 && !pat && access) {
-      const ok = await this.tryRefresh(true);
-      if (ok) {
-        const newAccess = await this.secrets.get(this.key("accessToken"));
-        if (newAccess) headers.set("Authorization", `Bearer ${newAccess}`);
-        res = await this.fetchWithTimeout(
-          `${this.apiBaseUrl()}${path}`,
-          { ...init, headers },
-          timeoutMs,
-        );
-      }
-    }
+    const url = `${this.apiBaseUrl()}${path}`;
 
-    if (!res.ok) {
-      let message = res.statusText;
-      try {
-        const body = (await res.json()) as { error?: string };
-        if (body.error) message = body.error;
-      } catch { /* ignore */ }
-      throw new ApiError(res.status, message);
+    await acquireSlot();
+    try {
+      for (let attempt = 0; ; attempt++) {
+        let res = await this.fetchWithTimeout(url, { ...init, headers }, timeoutMs);
+        if (res.status === 401 && !pat && access) {
+          const ok = await this.tryRefresh(true);
+          if (ok) {
+            const newAccess = await this.secrets.get(this.key("accessToken"));
+            if (newAccess) headers.set("Authorization", `Bearer ${newAccess}`);
+            res = await this.fetchWithTimeout(url, { ...init, headers }, timeoutMs);
+          }
+        }
+
+        if (res.status === 429 && attempt < RATE_LIMIT_MAX_RETRIES) {
+          let body: unknown = null;
+          try { body = await res.json(); } catch { /* ignore */ }
+          const baseDelay = parseRetryAfterMs(res, body);
+          const delay = Math.min(baseDelay * (attempt + 1), RATE_LIMIT_MAX_DELAY_MS);
+          await sleep(delay);
+          continue;
+        }
+
+        if (!res.ok) {
+          let message = res.statusText;
+          try {
+            const body = (await res.json()) as { error?: string };
+            if (body.error) message = body.error;
+          } catch { /* ignore */ }
+          throw new ApiError(res.status, message);
+        }
+        if (res.status === 204) return undefined as T;
+        return (await res.json()) as T;
+      }
+    } finally {
+      releaseSlot();
     }
-    if (res.status === 204) return undefined as T;
-    return (await res.json()) as T;
   }
 }

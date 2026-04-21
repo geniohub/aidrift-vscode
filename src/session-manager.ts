@@ -90,6 +90,10 @@ interface PendingSpawn {
 const SPAWN_MATCH_WINDOW_MS = 60 * 1000;
 const SPAWN_PREFIX_LEN = 240;
 const MAX_PENDING_SPAWNS = 200;
+// Bound on spawn-toolUseIds we've observed locally. Used to gate the
+// /agent-spawns/:id/complete PATCH so we don't fire one call per tool_result
+// line during history re-ingest (most tool_results aren't Agent spawns).
+const MAX_KNOWN_SPAWN_IDS = 500;
 
 interface SessionDto {
   id: string;
@@ -139,6 +143,10 @@ export class SessionManager {
   private readonly pendingSpawns = new Map<string, PendingSpawn>();
   /** Adopted sessionHints, so we don't re-try adoption on every prompt. */
   private readonly adoptedHints = new Set<string>();
+  /** Tool-use ids we've observed as Agent/Task spawns locally. Gates the
+   *  spawn-complete PATCH so tool_results we didn't originate don't trigger
+   *  one HTTP call each (which used to flood the API during history ingest). */
+  private readonly knownSpawnToolUseIds = new Set<string>();
   private activeSessionId: string | null = null;
   private activeTaskDescription: string | null = null;
   private sweepTimer: NodeJS.Timeout | undefined;
@@ -177,6 +185,7 @@ export class SessionManager {
     this.lastTurnIdByHint.clear();
     this.pendingSpawns.clear();
     this.adoptedHints.clear();
+    this.knownSpawnToolUseIds.clear();
     this.activeSessionId = null;
     this.activeTaskDescription = null;
   }
@@ -390,7 +399,12 @@ export class SessionManager {
         }
         // Not a bash result — if it matches a pending Agent spawn, patch the
         // ledger row with the preview. Fire-and-forget; 404 = not ours.
-        void this.maybeCompleteSpawn(r.toolUseId, r.textPreview, r.isError);
+        // Gate on the local known-spawns set: most tool_results are Read/Bash/
+        // Edit and would 404 — without this gate, history re-ingest fires one
+        // PATCH per tool_result and blows through the API rate limit.
+        if (this.knownSpawnToolUseIds.has(r.toolUseId)) {
+          void this.maybeCompleteSpawn(r.toolUseId, r.textPreview, r.isError);
+        }
       }
       return;
     }
@@ -408,7 +422,16 @@ export class SessionManager {
     for (const hint of entry.bashExecHints) {
       p.bashExecHints.set(hint.toolUseId, hint.stage);
     }
-    if (entry.agentSpawns.length > 0) p.agentSpawns.push(...entry.agentSpawns);
+    if (entry.agentSpawns.length > 0) {
+      p.agentSpawns.push(...entry.agentSpawns);
+      for (const spawn of entry.agentSpawns) {
+        if (this.knownSpawnToolUseIds.size >= MAX_KNOWN_SPAWN_IDS) {
+          const oldest = this.knownSpawnToolUseIds.values().next().value;
+          if (oldest !== undefined) this.knownSpawnToolUseIds.delete(oldest);
+        }
+        this.knownSpawnToolUseIds.add(spawn.toolUseId);
+      }
+    }
     if (entry.model) p.model = entry.model;
     // First assistant chunk sets "reply started"; every chunk advances
     // "reply completed" so the last one wins.
@@ -611,10 +634,14 @@ export class SessionManager {
           resultIsError: isError,
         }),
       });
+      this.knownSpawnToolUseIds.delete(toolUseId);
     } catch (err) {
       const e = err as { status?: number };
       // 404 = not an Agent spawn (e.g. a Read/Bash tool_result). Silent.
-      if (e.status === 404) return;
+      if (e.status === 404) {
+        this.knownSpawnToolUseIds.delete(toolUseId);
+        return;
+      }
       console.error("[aidrift] failed to complete agent spawn:", err);
     }
   }
