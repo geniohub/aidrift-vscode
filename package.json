@@ -26,10 +26,10 @@
   "homepage": "https://drift.geniohub.com",
   "repository": {
     "type": "git",
-    "url": "https://github.com/geniohub/AiDriftClient.git"
+    "url": "https://github.com/geniohub/aidrift-vscode.git"
   },
   "bugs": {
-    "url": "https://github.com/geniohub/AiDriftClient/issues"
+    "url": "https://github.com/geniohub/aidrift-vscode/issues"
   },
   "activationEvents": [
     "onStartupFinished"
@@ -289,7 +289,6 @@
     "test": "echo 'no extension tests yet'"
   },
   "dependencies": {
-    "@aidrift/core": "workspace:*",
     "chokidar": "^4.0.1"
   },
   "devDependencies": {

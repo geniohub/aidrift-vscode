@@ -4,7 +4,7 @@
 // heuristics so scoring actually fires during normal chat (the user
 // shouldn't have to explicitly mark every turn).
 
-import { similarity } from "@aidrift/core";
+import { similarity } from "./similarity";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { ApiClient } from "./api-client";

@@ -2,7 +2,8 @@ import * as vscode from "vscode";
 import { execFile } from "node:child_process";
 import { normalize } from "node:path";
 import { promisify } from "node:util";
-import { VERSION } from "@aidrift/core";
+const VERSION: string =
+  vscode.extensions.getExtension("GenioHub.aidrift")?.packageJSON.version ?? "dev";
 import { ApiClient, ApiError, setMaxConcurrentRequests } from "./api-client";
 import { ClaudeCodeWatcher, type WatcherPersistence } from "./watchers/claude-code-watcher";
 import { CodexWatcher } from "./watchers/codex-watcher";
