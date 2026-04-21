@@ -14,23 +14,31 @@ VSCode extension that watches your Claude Code and OpenAI Codex chats and warns 
 
 ## Install
 
-AI Drift is in **private beta**. The extension is not yet on the VS Code Marketplace — install it from the code-gated `.vsix`:
+From VS Code:
+
+1. Open the **Extensions** pane (`Cmd+Shift+X` / `Ctrl+Shift+X`).
+2. Search for **AI Drift Detector** (publisher **GenioHub**).
+3. Click **Install**.
+
+Or from the command line:
 
 ```bash
-# 1. Open the gated download page and paste your invite code
-open "https://drift.geniohub.com/download?code=YOUR_CODE"
-
-# 2. Install the downloaded .vsix
-code --install-extension ~/Downloads/aidrift-*.vsix
+code --install-extension GenioHub.aidrift
 ```
 
-Request an invite code at <https://drift.geniohub.com/request-access>.
+Marketplace page: <https://marketplace.visualstudio.com/items?itemName=GenioHub.aidrift>
 
 ## Setup
 
-Requires an AI Drift backend. The default profile points at `https://drift.geniohub.com`. For local dev, run `docker compose up -d` in the repo root, then use **Drift: Add Profile** to register `http://localhost:3331/api` and switch to it.
+The extension connects to AiDrift at `https://drift.geniohub.com` by default. Sign up or sign in:
 
-Sign in via the welcome view in the AI Drift sidebar, the walkthrough, or `Drift: Sign In`. Browser sign-in is the recommended path — it opens the dashboard, you log in or register, and the token is delivered back to the editor via the `vscode://` URI handler.
+1. Click the **AI Drift** icon in the activity bar.
+2. Click **Sign In** in the welcome view, or run `Drift: Sign In` from the Command Palette.
+3. Pick **browser** sign-in for the zero-copy flow — the dashboard opens, you sign up or log in, and the token comes back to VS Code automatically. Or paste a PAT from the dashboard's **Generate Token** button.
+
+The same sign-in works for the [companion CLI](https://github.com/geniohub/aidrift-cli) (`npm i -g @aidrift/cli`) and the [Claude Code plugin](https://github.com/geniohub/aidrift-plugin) — credentials are shared via `~/.drift/profiles.json`.
+
+For local/self-hosted AiDrift backends, run `Drift: Add Profile` to register a second profile pointing at your backend URL (e.g. `http://localhost:3331/api`) and switch to it.
 
 ## Commands
 

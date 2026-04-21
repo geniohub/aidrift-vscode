@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Type-check
+        run: npx tsc -p tsconfig.json --noEmit
+
+      - name: Bundle with esbuild
+        run: npm run bundle
+
+      - name: Package .vsix (dry-run, proves vsce can build)
+        run: npx vsce package --no-dependencies -o /tmp/aidrift-test.vsix
+
+      - name: Verify .vsix is non-trivial
+        run: |
+          size=$(stat -c%s /tmp/aidrift-test.vsix)
+          if [ "$size" -lt 50000 ]; then
+            echo "::error::.vsix too small ($size bytes) — something's wrong with the bundle"
+            exit 1
+          fi
+          echo "vsix size: $size bytes"
