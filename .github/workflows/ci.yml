@@ -31,7 +31,10 @@ jobs:
       - name: Verify .vsix is non-trivial
         run: |
           size=$(stat -c%s /tmp/aidrift-test.vsix)
-          if [ "$size" -lt 50000 ]; then
+          # .vsix is a zip; the 104kb dist/extension.js compresses to ~20kb.
+          # 20kb catches empty/broken packages without false-positiving on
+          # compressed real content.
+          if [ "$size" -lt 20000 ]; then
             echo "::error::.vsix too small ($size bytes) — something's wrong with the bundle"
             exit 1
           fi
