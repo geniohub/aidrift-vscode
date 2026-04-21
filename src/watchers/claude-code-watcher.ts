@@ -10,6 +10,11 @@ import { parseLine, type ParsedEntry } from "./jsonl-parser.js";
 
 export type ClaudeEntryHandler = (entry: ParsedEntry, filePath: string) => Promise<void>;
 
+export interface IngestOpts {
+  concurrency?: number;
+  onProgress?: (done: number, total: number, currentFile?: string) => void;
+}
+
 export interface WatcherPersistence {
   load(): Record<string, number>;
   save(offsets: Record<string, number>): void;
@@ -86,12 +91,28 @@ export class ClaudeCodeWatcher {
     this.pollTimer = setInterval(() => void this.sweep(), POLL_INTERVAL_MS);
   }
 
-  private async ingestExistingFiles(): Promise<void> {
+  private async ingestExistingFiles(opts?: IngestOpts): Promise<void> {
     const files = await this.listJsonlFiles(this.rootDir);
     files.sort();
-    for (const filePath of files) {
-      await this.ingest(filePath, true);
-    }
+    const concurrency = Math.max(1, opts?.concurrency ?? 1);
+    const onProgress = opts?.onProgress;
+    let done = 0;
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < files.length) {
+        const idx = cursor++;
+        const filePath = files[idx];
+        if (!filePath) continue;
+        try {
+          await this.ingest(filePath, true);
+        } catch (err) {
+          console.error(`[aidrift] rescan failed for ${filePath}:`, err);
+        }
+        done++;
+        onProgress?.(done, files.length, filePath);
+      }
+    };
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
   }
 
   private async listJsonlFiles(dir: string): Promise<string[]> {
@@ -136,10 +157,10 @@ export class ClaudeCodeWatcher {
    * replay idempotent. Used by the `aidrift.rescanClaudeHistory` command to
    * recover sessions that a prior (buggy) extension version dropped silently.
    */
-  async rescanFromScratch(): Promise<void> {
+  async rescanFromScratch(opts?: IngestOpts): Promise<void> {
     this.offsets.clear();
     this.persistence?.save({});
-    await this.ingestExistingFiles();
+    await this.ingestExistingFiles(opts);
   }
 
   private async sweep(): Promise<void> {

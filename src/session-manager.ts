@@ -452,6 +452,18 @@ export class SessionManager {
     this.pendingFlushTimers.set(sessionHint, timer);
   }
 
+  /**
+   * Flush every sessionHint with a pending pair, immediately — cancels
+   * the debounce timers and awaits all POSTs. Used at the tail of a rescan
+   * so we don't leave the last pair of each transcript dangling for 1.2s.
+   */
+  async drainPending(): Promise<void> {
+    for (const timer of this.pendingFlushTimers.values()) clearTimeout(timer);
+    this.pendingFlushTimers.clear();
+    const hints = Array.from(this.pending.keys());
+    await Promise.all(hints.map((h) => this.flushPending(h).catch(() => undefined)));
+  }
+
   private async maybeImplicitReject(sessionHint: string, newPrompt: string): Promise<void> {
     const sessionId = this.sessionBySH.get(sessionHint);
     if (!sessionId) return;

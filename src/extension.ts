@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { normalize } from "node:path";
 import { promisify } from "node:util";
 import { VERSION } from "@aidrift/core";
-import { ApiClient, ApiError } from "./api-client";
+import { ApiClient, ApiError, setMaxConcurrentRequests } from "./api-client";
 import { ClaudeCodeWatcher, type WatcherPersistence } from "./watchers/claude-code-watcher";
 import { CodexWatcher } from "./watchers/codex-watcher";
 import { SessionManager } from "./session-manager";
@@ -522,14 +522,39 @@ async function rescanClaudeHistoryFlow(): Promise<void> {
     );
     return;
   }
+  // Push through the history faster: raise HTTP concurrency for the duration
+  // of the rescan. The api-client still honors server 429s, so the server
+  // backpressures us if we overshoot. 16 is an order of magnitude above
+  // normal operation and empirically plenty for a cold re-ingest.
+  const restoreConcurrency = setMaxConcurrentRequests(16);
   try {
     await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: "AI Drift: rescanning Claude Code history…" },
-      () => claudeWatcher!.rescanFromScratch(),
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "AI Drift: rescanning Claude Code history",
+        cancellable: true,
+      },
+      async (progress, token) => {
+        let lastPct = 0;
+        await claudeWatcher!.rescanFromScratch({
+          concurrency: 4,
+          onProgress: (done, total) => {
+            if (token.isCancellationRequested) return;
+            const pct = Math.floor((done / total) * 100);
+            const inc = pct - lastPct;
+            lastPct = pct;
+            progress.report({ increment: inc, message: `${done}/${total} files (${pct}%)` });
+          },
+        });
+        progress.report({ message: "flushing pending turns…" });
+        await sessionManager.drainPending();
+      },
     );
     void vscode.window.showInformationMessage("AI Drift: rescan complete.");
   } catch (err) {
     void vscode.window.showErrorMessage(`AI Drift rescan failed: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    restoreConcurrency();
   }
 }
 

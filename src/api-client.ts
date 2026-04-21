@@ -13,16 +13,35 @@ const REFRESH_AHEAD_MS = 120_000;
 // with many tool_results) can't detonate the server's rate limit in one shot.
 // Picked conservatively: the API's global bucket is 3000/min per user, and
 // 4 in-flight requests are plenty for the watcher's sequential ingest path.
-const MAX_CONCURRENT_REQUESTS = 4;
+const DEFAULT_MAX_CONCURRENT_REQUESTS = 4;
 const RATE_LIMIT_MAX_RETRIES = 3;
 const RATE_LIMIT_DEFAULT_DELAY_MS = 1_000;
 const RATE_LIMIT_MAX_DELAY_MS = 30_000;
 
+let maxConcurrent = DEFAULT_MAX_CONCURRENT_REQUESTS;
 let inFlight = 0;
 const waiters: Array<() => void> = [];
 
+/**
+ * Temporarily change the HTTP concurrency cap. Callers that push throughput
+ * (e.g. the rescan command) raise it, then restore via the returned disposer.
+ * 429 retry with Retry-After still protects the server if this overshoots.
+ */
+export function setMaxConcurrentRequests(n: number): () => void {
+  const prev = maxConcurrent;
+  maxConcurrent = Math.max(1, Math.floor(n));
+  // Wake up queued requests that can now proceed under the new, higher cap.
+  while (inFlight < maxConcurrent && waiters.length > 0) {
+    const next = waiters.shift();
+    if (next) next();
+  }
+  return () => {
+    maxConcurrent = prev;
+  };
+}
+
 async function acquireSlot(): Promise<void> {
-  if (inFlight < MAX_CONCURRENT_REQUESTS) {
+  if (inFlight < maxConcurrent) {
     inFlight += 1;
     return;
   }
@@ -32,8 +51,10 @@ async function acquireSlot(): Promise<void> {
 
 function releaseSlot(): void {
   inFlight -= 1;
-  const next = waiters.shift();
-  if (next) next();
+  if (inFlight < maxConcurrent && waiters.length > 0) {
+    const next = waiters.shift();
+    if (next) next();
+  }
 }
 
 function parseRetryAfterMs(res: Response, body: unknown): number {
