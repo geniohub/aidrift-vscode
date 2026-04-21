@@ -302,7 +302,11 @@ export class SessionManager {
     if (entry.kind === "skip") return;
 
     if (entry.kind === "ai-title") {
-      const sid = this.sessionBySH.get(entry.sessionHint);
+      let sid = this.sessionBySH.get(entry.sessionHint);
+      if (!sid) {
+        const existing = await this.findSessionByHint(entry.sessionHint);
+        if (existing) sid = this.cacheSession(existing);
+      }
       if (sid) {
         try {
           await this.api.request(`/sessions/${sid}`, {

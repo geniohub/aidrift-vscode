@@ -27,6 +27,12 @@ interface SessionMetaPayload {
   cwd?: string;
 }
 
+interface ThreadNameUpdatedPayload {
+  type: "thread_name_updated";
+  thread_id?: string;
+  thread_name?: string;
+}
+
 interface RawLine {
   type: string;
   timestamp?: string;
@@ -84,6 +90,18 @@ export function createCodexParser(initialHint: string | null): (line: string) =>
       const meta = raw.payload as SessionMetaPayload;
       if (meta.id) state.sessionHint = meta.id;
       if (meta.cwd) state.workspacePath = meta.cwd;
+      return { kind: "skip" };
+    }
+
+    if (raw.type === "event_msg" && raw.payload) {
+      const ev = raw.payload as { type?: string } & Partial<ThreadNameUpdatedPayload>;
+      if (ev.type === "thread_name_updated" && typeof ev.thread_name === "string") {
+        const title = ev.thread_name.trim();
+        if (!title) return { kind: "skip" };
+        const hint = ev.thread_id ?? state.sessionHint;
+        if (!hint) return { kind: "skip" };
+        return { kind: "ai-title", sessionHint: hint, title };
+      }
       return { kind: "skip" };
     }
 
