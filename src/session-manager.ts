@@ -7,7 +7,8 @@
 import { similarity } from "./similarity";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { ApiClient } from "./api-client";
+import { ApiError, type ApiClient } from "./api-client";
+import type { Logger } from "./log";
 import type {
   ParsedEntry,
   ParsedFileEdit,
@@ -94,6 +95,13 @@ const MAX_PENDING_SPAWNS = 200;
 // /agent-spawns/:id/complete PATCH so we don't fire one call per tool_result
 // line during history re-ingest (most tool_results aren't Agent spawns).
 const MAX_KNOWN_SPAWN_IDS = 500;
+// Bound on spawn-toolUseIds already posted to /agent-spawns in this process.
+// Prevents repeated POST floods when transcript lines are replayed.
+const MAX_RECORDED_SPAWN_IDS = 1000;
+// Bound on turn ids whose side-effects (file-edits, spawn post, unsettled
+// queueing) have already been emitted in this process. Prevents replays of
+// a deduped turn from repeatedly posting secondary writes.
+const MAX_EMITTED_TURN_IDS = 2000;
 
 interface SessionDto {
   id: string;
@@ -122,6 +130,8 @@ const IMPLICIT_REJECT_SIMILARITY = 0.6;
 const IMPLICIT_ACCEPT_MS = 5 * 60 * 1000; // 5 minutes
 const SWEEP_INTERVAL_MS = 30 * 1000;
 const ASSISTANT_FLUSH_DEBOUNCE_MS = 1200;
+const AUTH_BACKOFF_MS = 30_000;
+const SKIP_SESSION_SENTINEL = "__skip__";
 
 export class SessionManager {
   /** sessionHint (Claude transcript UUID) → our Session.id */
@@ -137,6 +147,8 @@ export class SessionManager {
   /** Most-recently-posted turn id per session id — used so spawn posting can
    *  attach to the right parent turn without refetching the session. */
   private readonly lastTurnIdByHint = new Map<string, string>();
+  /** Turn ids for which we already emitted side-effects locally. */
+  private readonly emittedTurnIds = new Set<string>();
   /** Pending Agent/Task spawns, keyed by prompt-prefix hash. When a new
    *  sub-agent session's first prompt matches one of these, we adopt the
    *  orphan as a child. LRU-capped. */
@@ -147,15 +159,52 @@ export class SessionManager {
    *  spawn-complete PATCH so tool_results we didn't originate don't trigger
    *  one HTTP call each (which used to flood the API during history ingest). */
   private readonly knownSpawnToolUseIds = new Set<string>();
+  /** Spawn ids that were already recorded via POST /agent-spawns in this run. */
+  private readonly recordedSpawnToolUseIds = new Set<string>();
+  /** In-flight POST /agent-spawns calls, keyed by toolUseId. */
+  private readonly postingSpawnToolUseIds = new Set<string>();
+  /** In-flight PATCH /agent-spawns/:toolUseId/complete calls. */
+  private readonly completingSpawnToolUseIds = new Set<string>();
   private activeSessionId: string | null = null;
   private activeTaskDescription: string | null = null;
   private sweepTimer: NodeJS.Timeout | undefined;
+  private metricsTimer: NodeJS.Timeout | undefined;
+  private authBackoffUntil = 0;
+  private authBackoffRetryTimer: NodeJS.Timeout | undefined;
+  private authFailureNotified = false;
+  private readonly metrics = {
+    entriesUserPrompt: 0,
+    entriesAssistantReply: 0,
+    entriesToolResults: 0,
+    flushCalls: 0,
+    flushSuccess: 0,
+    flushErrors: 0,
+    turnPostCount: 0,
+    turnPostMsTotal: 0,
+    turnPostMsMax: 0,
+    turnReplayDedup: 0,
+    spawnPostAttempt: 0,
+    spawnPostSkipRecorded: 0,
+    spawnPostSkipInflight: 0,
+    spawnPostSuccess: 0,
+    spawnPostErrors: 0,
+    spawnCompleteAttempt: 0,
+    spawnCompleteSkipInflight: 0,
+    spawnCompleteSuccess: 0,
+    spawnCompleteErrors: 0,
+    authBackoffs: 0,
+  };
 
-  constructor(private readonly api: ApiClient) {}
+  constructor(
+    private readonly api: ApiClient,
+    private readonly log?: Logger,
+    private readonly onAuthFailure?: () => void,
+  ) {}
 
   start(): void {
     if (this.sweepTimer) return;
     this.sweepTimer = setInterval(() => void this.sweepForImplicitAccepts(), SWEEP_INTERVAL_MS);
+    this.metricsTimer = setInterval(() => this.emitMetrics("tick"), 15_000);
   }
 
   stop(): void {
@@ -167,6 +216,11 @@ export class SessionManager {
       clearTimeout(timer);
     }
     this.pendingFlushTimers.clear();
+    if (this.metricsTimer) {
+      clearInterval(this.metricsTimer);
+      this.metricsTimer = undefined;
+    }
+    this.emitMetrics("stop");
   }
 
   /**
@@ -183,11 +237,21 @@ export class SessionManager {
     this.lastTurn.clear();
     this.unsettled.clear();
     this.lastTurnIdByHint.clear();
+    this.emittedTurnIds.clear();
     this.pendingSpawns.clear();
     this.adoptedHints.clear();
     this.knownSpawnToolUseIds.clear();
+    this.recordedSpawnToolUseIds.clear();
+    this.postingSpawnToolUseIds.clear();
+    this.completingSpawnToolUseIds.clear();
     this.activeSessionId = null;
     this.activeTaskDescription = null;
+    this.authBackoffUntil = 0;
+    this.authFailureNotified = false;
+    if (this.authBackoffRetryTimer) {
+      clearTimeout(this.authBackoffRetryTimer);
+      this.authBackoffRetryTimer = undefined;
+    }
   }
 
   getActiveSessionId(): string | null {
@@ -226,6 +290,12 @@ export class SessionManager {
     return session.id;
   }
 
+  private cachedSessionId(sessionHint: string): string | null {
+    const sid = this.sessionBySH.get(sessionHint);
+    if (!sid || sid === SKIP_SESSION_SENTINEL) return null;
+    return sid;
+  }
+
   // Fire-and-forget PATCH to fill Session.gitRepoUrl on a session created by
   // an older extension version. Server-side only writes when the column is
   // still null, so concurrent heals across devices can't stomp each other.
@@ -261,8 +331,9 @@ export class SessionManager {
     startedAtHint?: string,
   ): Promise<string | null> {
     const cached = this.sessionBySH.get(sessionHint);
-    if (cached === "__skip__") return null;
+    if (cached === SKIP_SESSION_SENTINEL) return null;
     if (cached) return cached;
+    if (this.isAuthBackoffActive()) return null;
     const existing = await this.findSessionByHint(sessionHint, workspacePath);
     if (existing) {
       // Self-heal: older extension versions (or create-by-cli) may have left
@@ -297,7 +368,7 @@ export class SessionManager {
       const e = createErr as { status?: number };
       // 409 = sessionHint already belongs to another user — skip silently.
       if (e.status === 409) {
-        this.sessionBySH.set(sessionHint, "__skip__");
+        this.sessionBySH.set(sessionHint, SKIP_SESSION_SENTINEL);
         return null;
       }
       // A concurrent create (or prior collision resolved server-side) can make
@@ -316,7 +387,7 @@ export class SessionManager {
     if (entry.kind === "skip") return;
 
     if (entry.kind === "ai-title") {
-      let sid = this.sessionBySH.get(entry.sessionHint);
+      let sid = this.cachedSessionId(entry.sessionHint);
       if (!sid) {
         const existing = await this.findSessionByHint(entry.sessionHint);
         if (existing) sid = this.cacheSession(existing);
@@ -337,6 +408,7 @@ export class SessionManager {
     const effectiveWorkspacePath = workspacePath ?? ("workspacePath" in entry ? entry.workspacePath : undefined);
 
     if (entry.kind === "user-prompt") {
+      this.metrics.entriesUserPrompt++;
       // Bootstrap a session as soon as the first prompt is seen so tracking
       // appears immediately, even before the assistant reply is flushed.
       try {
@@ -347,9 +419,9 @@ export class SessionManager {
           effectiveWorkspacePath,
           entry.timestamp,
         );
-        if (!sid) return; // belongs to another user
-        this.activeSessionId = sid;
+        if (sid) this.activeSessionId = sid;
       } catch (err) {
+        this.maybeApplyAuthBackoff(err, "user-prompt ensureSession");
         console.error("[aidrift] ensureSession bootstrap failed:", err);
       }
 
@@ -384,6 +456,7 @@ export class SessionManager {
     // tool-results: pair with previously-seen bash hints to derive pass/fail,
     // and forward Agent/Task results to the spawn ledger.
     if (entry.kind === "tool-results") {
+      this.metrics.entriesToolResults++;
       const p = this.pending.get(entry.sessionHint);
       if (!p) return;
       for (const r of entry.results) {
@@ -410,6 +483,7 @@ export class SessionManager {
     }
 
     // assistant-reply
+    this.metrics.entriesAssistantReply++;
     const p = this.pending.get(entry.sessionHint);
     if (!p) return;
     if (entry.text) p.assistantChunks.push(entry.text);
@@ -465,7 +539,7 @@ export class SessionManager {
   }
 
   private async maybeImplicitReject(sessionHint: string, newPrompt: string): Promise<void> {
-    const sessionId = this.sessionBySH.get(sessionHint);
+    const sessionId = this.cachedSessionId(sessionHint);
     if (!sessionId) return;
     const last = this.lastTurn.get(sessionId);
     if (!last || last.outcomeSettled) return;
@@ -488,6 +562,7 @@ export class SessionManager {
   }
 
   private async flushPending(sessionHint: string): Promise<void> {
+    this.metrics.flushCalls++;
     const timer = this.pendingFlushTimers.get(sessionHint);
     if (timer) {
       clearTimeout(timer);
@@ -506,18 +581,25 @@ export class SessionManager {
         p.promptAt,
       );
     } catch (err) {
+      this.maybeApplyAuthBackoff(err, "flush ensureSession");
+      this.logFlushError("flush ensureSession", err);
       console.error("[aidrift] ensureSession in flush failed:", err);
       // Don't delete the pending pair — a transient error should be retried
       // on the next flush. But don't block the caller either.
       return;
     }
     if (!sessionId) {
-      // belongs to another user — drop the pending pair so it doesn't
-      // accumulate forever.
-      this.pending.delete(sessionHint);
+      if (this.sessionBySH.get(sessionHint) === SKIP_SESSION_SENTINEL) {
+        // Belongs to another user — drop the pending pair so it does not
+        // accumulate forever.
+        this.pending.delete(sessionHint);
+      }
+      // During auth backoff (or any transient ensureSession miss), keep the
+      // pending pair so a later retry can upload it.
       return;
     }
     try {
+      const t0 = Date.now();
       const turn = await this.api.request<{ id: string }>(`/sessions/${sessionId}/turns`, {
         method: "POST",
         body: JSON.stringify({
@@ -547,28 +629,57 @@ export class SessionManager {
         }),
       });
       this.activeSessionId = sessionId;
-      this.lastTurn.set(sessionId, {
-        id: turn.id,
-        userPrompt: p.userPromptText,
-        postedAt: Date.now(),
-        outcomeSettled: false,
-      });
+      const turnPostMs = Date.now() - t0;
+      this.metrics.turnPostCount++;
+      this.metrics.turnPostMsTotal += turnPostMs;
+      this.metrics.turnPostMsMax = Math.max(this.metrics.turnPostMsMax, turnPostMs);
+      const seenTurnReplay = this.emittedTurnIds.has(turn.id);
+      if (!seenTurnReplay) {
+        if (this.emittedTurnIds.size >= MAX_EMITTED_TURN_IDS) {
+          const oldest = this.emittedTurnIds.values().next().value;
+          if (oldest !== undefined) this.emittedTurnIds.delete(oldest);
+        }
+        this.emittedTurnIds.add(turn.id);
+      } else {
+        this.metrics.turnReplayDedup++;
+      }
+
+      const existingLast = this.lastTurn.get(sessionId);
+      if (!existingLast || existingLast.id !== turn.id) {
+        this.lastTurn.set(sessionId, {
+          id: turn.id,
+          userPrompt: p.userPromptText,
+          postedAt: Date.now(),
+          outcomeSettled: false,
+        });
+      }
       this.lastTurnIdByHint.set(sessionHint, turn.id);
-      this.unsettled.set(turn.id, { sessionId, postedAt: Date.now(), userPrompt: p.userPromptText });
+      if (!seenTurnReplay) {
+        this.unsettled.set(turn.id, {
+          sessionId,
+          postedAt: Date.now(),
+          userPrompt: p.userPromptText,
+        });
+      }
       // Fire-and-forget file-edits post; collision detection runs server-
       // side. Failures are non-fatal: scoring / turn tracking already
       // landed, this is supplementary signal.
-      if (p.fileEdits.length > 0) {
+      if (!seenTurnReplay && p.fileEdits.length > 0) {
         void this.postFileEdits(sessionId, turn.id, p.fileEdits);
       }
       // Sub-agent spawns: record one AgentSpawn per Task/Agent tool_use. The
       // ledger row is what later matches an orphan child JSONL. Non-fatal.
-      if (p.agentSpawns.length > 0) {
+      if (!seenTurnReplay && p.agentSpawns.length > 0) {
         for (const spawn of p.agentSpawns) {
           void this.postAgentSpawn(sessionId, turn.id, spawn);
         }
       }
+      this.metrics.flushSuccess++;
+      this.clearAuthBackoff();
     } catch (err) {
+      this.maybeApplyAuthBackoff(err, "post turn");
+      this.metrics.flushErrors++;
+      this.logFlushError("post turn", err);
       console.error("[aidrift] failed to post turn:", err);
     }
     this.pending.delete(sessionHint);
@@ -600,6 +711,16 @@ export class SessionManager {
     parentTurnId: string,
     spawn: ParsedAgentSpawn,
   ): Promise<void> {
+    this.metrics.spawnPostAttempt++;
+    if (this.recordedSpawnToolUseIds.has(spawn.toolUseId)) {
+      this.metrics.spawnPostSkipRecorded++;
+      return;
+    }
+    if (this.postingSpawnToolUseIds.has(spawn.toolUseId)) {
+      this.metrics.spawnPostSkipInflight++;
+      return;
+    }
+    this.postingSpawnToolUseIds.add(spawn.toolUseId);
     try {
       await this.api.request(`/agent-spawns`, {
         method: "POST",
@@ -612,6 +733,12 @@ export class SessionManager {
           description: spawn.description,
         }),
       });
+      if (this.recordedSpawnToolUseIds.size >= MAX_RECORDED_SPAWN_IDS) {
+        const oldest = this.recordedSpawnToolUseIds.values().next().value;
+        if (oldest !== undefined) this.recordedSpawnToolUseIds.delete(oldest);
+      }
+      this.recordedSpawnToolUseIds.add(spawn.toolUseId);
+      this.metrics.spawnPostSuccess++;
       // Remember the prompt prefix so we can adopt an orphan child later.
       const key = normalizeSpawnPrefix(spawn.prompt);
       if (this.pendingSpawns.size >= MAX_PENDING_SPAWNS) {
@@ -628,8 +755,23 @@ export class SessionManager {
     } catch (err) {
       const e = err as { status?: number };
       // 404/409 — parent turn disappeared or duplicate; not fatal.
-      if (e.status === 404 || e.status === 409) return;
+      if (e.status === 404 || e.status === 409) {
+        if (e.status === 409) {
+          // Idempotent duplicate on server: treat as recorded so replays
+          // don't keep posting this same spawn id.
+          if (this.recordedSpawnToolUseIds.size >= MAX_RECORDED_SPAWN_IDS) {
+            const oldest = this.recordedSpawnToolUseIds.values().next().value;
+            if (oldest !== undefined) this.recordedSpawnToolUseIds.delete(oldest);
+          }
+          this.recordedSpawnToolUseIds.add(spawn.toolUseId);
+        }
+        this.metrics.spawnPostSuccess++;
+        return;
+      }
+      this.metrics.spawnPostErrors++;
       console.error("[aidrift] failed to post agent spawn:", err);
+    } finally {
+      this.postingSpawnToolUseIds.delete(spawn.toolUseId);
     }
   }
 
@@ -638,6 +780,12 @@ export class SessionManager {
     resultPreview: string | undefined,
     isError: boolean,
   ): Promise<void> {
+    this.metrics.spawnCompleteAttempt++;
+    if (this.completingSpawnToolUseIds.has(toolUseId)) {
+      this.metrics.spawnCompleteSkipInflight++;
+      return;
+    }
+    this.completingSpawnToolUseIds.add(toolUseId);
     try {
       await this.api.request(`/agent-spawns/${encodeURIComponent(toolUseId)}/complete`, {
         method: "PATCH",
@@ -647,14 +795,19 @@ export class SessionManager {
         }),
       });
       this.knownSpawnToolUseIds.delete(toolUseId);
+      this.metrics.spawnCompleteSuccess++;
     } catch (err) {
       const e = err as { status?: number };
       // 404 = not an Agent spawn (e.g. a Read/Bash tool_result). Silent.
       if (e.status === 404) {
         this.knownSpawnToolUseIds.delete(toolUseId);
+        this.metrics.spawnCompleteSuccess++;
         return;
       }
+      this.metrics.spawnCompleteErrors++;
       console.error("[aidrift] failed to complete agent spawn:", err);
+    } finally {
+      this.completingSpawnToolUseIds.delete(toolUseId);
     }
   }
 
@@ -671,7 +824,7 @@ export class SessionManager {
     // Resolve the child session id (may not be cached yet — the user-prompt
     // path bootstraps the session before calling us).
     const childId = this.sessionBySH.get(sessionHint);
-    if (!childId || childId === "__skip__") return;
+    if (!childId || childId === SKIP_SESSION_SENTINEL) return;
     try {
       await this.api.request(`/sessions/${childId}/adopt-as-child`, {
         method: "POST",
@@ -726,5 +879,81 @@ export class SessionManager {
         console.error("[aidrift] implicit-accept PATCH failed:", err);
       }
     }
+  }
+
+  private emitMetrics(reason: string): void {
+    if (!this.log) return;
+    const active =
+      this.metrics.entriesUserPrompt +
+      this.metrics.entriesAssistantReply +
+      this.metrics.entriesToolResults +
+      this.metrics.flushCalls +
+      this.metrics.spawnPostAttempt +
+      this.metrics.spawnCompleteAttempt;
+    if (active === 0) return;
+    this.log.info("session manager stats", {
+      reason,
+      ...this.metrics,
+      turnPostMsAvg:
+        this.metrics.turnPostCount > 0
+          ? Math.round(this.metrics.turnPostMsTotal / this.metrics.turnPostCount)
+          : 0,
+      unsettledTurns: this.unsettled.size,
+      pendingPairs: this.pending.size,
+      knownSpawnIds: this.knownSpawnToolUseIds.size,
+      postingSpawnIds: this.postingSpawnToolUseIds.size,
+      completingSpawnIds: this.completingSpawnToolUseIds.size,
+    });
+    for (const key of Object.keys(this.metrics) as Array<keyof typeof this.metrics>) {
+      this.metrics[key] = 0;
+    }
+  }
+
+  private isAuthBackoffActive(): boolean {
+    return Date.now() < this.authBackoffUntil;
+  }
+
+  private maybeApplyAuthBackoff(err: unknown, phase: string): void {
+    if (!(err instanceof ApiError) || err.status !== 401) return;
+    const wasInBackoff = this.isAuthBackoffActive();
+    const until = Date.now() + AUTH_BACKOFF_MS;
+    if (until > this.authBackoffUntil) this.authBackoffUntil = until;
+    this.metrics.authBackoffs++;
+    this.log?.warn("session manager auth backoff", {
+      phase,
+      backoffMs: AUTH_BACKOFF_MS,
+    });
+    if (!wasInBackoff && !this.authFailureNotified) {
+      this.authFailureNotified = true;
+      this.onAuthFailure?.();
+    }
+    if (this.authBackoffRetryTimer) clearTimeout(this.authBackoffRetryTimer);
+    this.authBackoffRetryTimer = setTimeout(() => {
+      this.authBackoffRetryTimer = undefined;
+      if (this.isAuthBackoffActive()) return;
+      for (const hint of this.pending.keys()) {
+        void this.flushPending(hint);
+      }
+    }, AUTH_BACKOFF_MS + 500);
+  }
+
+  private clearAuthBackoff(): void {
+    if (this.authBackoffUntil === 0 && !this.authFailureNotified) return;
+    this.authBackoffUntil = 0;
+    this.authFailureNotified = false;
+    if (this.authBackoffRetryTimer) {
+      clearTimeout(this.authBackoffRetryTimer);
+      this.authBackoffRetryTimer = undefined;
+    }
+  }
+
+  private logFlushError(phase: string, err: unknown): void {
+    const e = err as { status?: number; message?: string; name?: string };
+    this.log?.error("session manager flush error", {
+      phase,
+      status: e.status,
+      name: e.name,
+      message: e.message ?? String(err),
+    });
   }
 }

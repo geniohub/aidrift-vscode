@@ -94,13 +94,28 @@ export function createCodexParser(initialHint: string | null): (line: string) =>
     }
 
     if (raw.type === "event_msg" && raw.payload) {
-      const ev = raw.payload as { type?: string } & Partial<ThreadNameUpdatedPayload>;
-      if (ev.type === "thread_name_updated" && typeof ev.thread_name === "string") {
+      const ev = raw.payload as Record<string, unknown>;
+      const evType = typeof ev.type === "string" ? ev.type : undefined;
+      if (evType === "thread_name_updated" && typeof ev.thread_name === "string") {
         const title = ev.thread_name.trim();
         if (!title) return { kind: "skip" };
-        const hint = ev.thread_id ?? state.sessionHint;
+        const hint = (typeof ev.thread_id === "string" ? ev.thread_id : undefined) ?? state.sessionHint;
         if (!hint) return { kind: "skip" };
         return { kind: "ai-title", sessionHint: hint, title };
+      }
+      if (evType === "user_message" && typeof ev.message === "string") {
+        const text = ev.message.trim();
+        const hint = (typeof ev.thread_id === "string" ? ev.thread_id : undefined) ?? state.sessionHint;
+        if (!text || !hint) return { kind: "skip" };
+        syntheticCounter++;
+        return {
+          kind: "user-prompt",
+          uuid: `codex-${hint}-u${syntheticCounter}`,
+          sessionHint: hint,
+          text,
+          timestamp: ts,
+          workspacePath: state.workspacePath ?? undefined,
+        };
       }
       return { kind: "skip" };
     }

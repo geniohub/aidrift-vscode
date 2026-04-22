@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { ParsedEntry } from "./jsonl-parser.js";
 import { createCodexParser, sessionHintFromFilename } from "./codex-parser.js";
-import type { WatcherPersistence } from "./claude-code-watcher.js";
+import type { WatcherLog, WatcherPersistence } from "./claude-code-watcher.js";
 
 export type CodexEntryHandler = (entry: ParsedEntry, filePath: string) => Promise<void>;
 const POLL_INTERVAL_MS = 4_000;
@@ -18,13 +18,30 @@ export class CodexWatcher {
   private watcher: FSWatcher | undefined;
   private readonly offsets = new Map<string, number>();
   private readonly parsers = new Map<string, (line: string) => ParsedEntry>();
+  // Per-file ingest serialization: add/change/sweep can race and re-read the
+  // same byte range before offsets advance.
+  private readonly ingestInFlight = new Map<string, Promise<void>>();
+  private readonly ingestQueued = new Set<string>();
+  // Prevent overlapping async sweep loops from setInterval.
+  private sweepInFlight = false;
+  private sweepQueued = false;
   private pollTimer: NodeJS.Timeout | undefined;
   private saveTimer: NodeJS.Timeout | undefined;
+  private statsTimer: NodeJS.Timeout | undefined;
+  private readonly stats = {
+    ingestCalls: 0,
+    ingestQueued: 0,
+    emittedEntries: 0,
+    bytesRead: 0,
+    sweeps: 0,
+    sweepQueued: 0,
+  };
   private readonly rootDir: string;
 
   constructor(
     private readonly onEntry: CodexEntryHandler,
     private readonly persistence?: WatcherPersistence,
+    private readonly log?: WatcherLog,
   ) {
     this.rootDir = join(homedir(), ".codex", "sessions");
     if (persistence) {
@@ -63,6 +80,7 @@ export class CodexWatcher {
     });
     // FSEvents can occasionally miss rapid append notifications.
     this.pollTimer = setInterval(() => void this.sweep(), POLL_INTERVAL_MS);
+    this.statsTimer = setInterval(() => this.emitStats("tick"), 15_000);
   }
 
   async stop(): Promise<void> {
@@ -77,8 +95,17 @@ export class CodexWatcher {
     }
     await this.watcher?.close();
     this.watcher = undefined;
+    if (this.statsTimer) {
+      clearInterval(this.statsTimer);
+      this.statsTimer = undefined;
+    }
+    this.emitStats("stop");
     this.offsets.clear();
     this.parsers.clear();
+    this.ingestInFlight.clear();
+    this.ingestQueued.clear();
+    this.sweepInFlight = false;
+    this.sweepQueued = false;
   }
 
   private getParser(filePath: string): (line: string) => ParsedEntry {
@@ -91,6 +118,32 @@ export class CodexWatcher {
   }
 
   private async ingest(filePath: string, initial = false): Promise<void> {
+    this.stats.ingestCalls++;
+    const running = this.ingestInFlight.get(filePath);
+    if (running) {
+      this.stats.ingestQueued++;
+      this.ingestQueued.add(filePath);
+      await running;
+      return;
+    }
+
+    const run = (async () => {
+      let first = initial;
+      while (true) {
+        await this.ingestOnce(filePath, first);
+        first = false;
+        if (!this.ingestQueued.delete(filePath)) break;
+      }
+    })();
+    this.ingestInFlight.set(filePath, run);
+    try {
+      await run;
+    } finally {
+      this.ingestInFlight.delete(filePath);
+    }
+  }
+
+  private async ingestOnce(filePath: string, initial = false): Promise<void> {
     const prior = this.offsets.get(filePath);
     const start = initial && prior === undefined ? 0 : prior ?? 0;
     let size: number;
@@ -118,6 +171,7 @@ export class CodexWatcher {
     const chunks: Buffer[] = [];
     for await (const chunk of stream) chunks.push(chunk as Buffer);
     const data = Buffer.concat(chunks);
+    this.stats.bytesRead += data.length;
     const lastNewline = data.lastIndexOf(0x0a); // '\n'
     if (lastNewline === -1) return start; // wait for a complete line
 
@@ -127,6 +181,7 @@ export class CodexWatcher {
       if (!line) continue;
       const entry = parser(line);
       if (entry.kind !== "skip") {
+        this.stats.emittedEntries++;
         try {
           await this.onEntry(entry, filePath);
         } catch (err) {
@@ -138,6 +193,24 @@ export class CodexWatcher {
   }
 
   private async sweep(): Promise<void> {
+    if (this.sweepInFlight) {
+      this.stats.sweepQueued++;
+      this.sweepQueued = true;
+      return;
+    }
+    this.stats.sweeps++;
+    this.sweepInFlight = true;
+    try {
+      do {
+        this.sweepQueued = false;
+        await this.sweepOnce();
+      } while (this.sweepQueued);
+    } finally {
+      this.sweepInFlight = false;
+    }
+  }
+
+  private async sweepOnce(): Promise<void> {
     // Also rediscover files chokidar didn't fire "add" for — macOS FSEvents
     // sometimes drops events on the deeply-nested date subdirs Codex rolls
     // over into daily, which would leave today's new rollout unindexed.
@@ -185,6 +258,28 @@ export class CodexWatcher {
   private dropFileState(filePath: string): void {
     this.offsets.delete(filePath);
     this.parsers.delete(filePath);
+  }
+
+  private emitStats(reason: string): void {
+    if (!this.log) return;
+    if (
+      this.stats.ingestCalls === 0 &&
+      this.stats.emittedEntries === 0 &&
+      this.stats.sweeps === 0
+    ) {
+      return;
+    }
+    this.log.info("codex watcher stats", {
+      reason,
+      ...this.stats,
+      trackedFiles: this.offsets.size,
+    });
+    this.stats.ingestCalls = 0;
+    this.stats.ingestQueued = 0;
+    this.stats.emittedEntries = 0;
+    this.stats.bytesRead = 0;
+    this.stats.sweeps = 0;
+    this.stats.sweepQueued = 0;
   }
 }
 

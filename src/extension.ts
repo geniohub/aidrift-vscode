@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 const VERSION: string =
   vscode.extensions.getExtension("GenioHub.aidrift")?.packageJSON.version ?? "dev";
 import { ApiClient, ApiError, setMaxConcurrentRequests } from "./api-client";
+import { createOutputLogger, type Logger } from "./log";
 import { ClaudeCodeWatcher, type WatcherPersistence } from "./watchers/claude-code-watcher";
 import { CodexWatcher } from "./watchers/codex-watcher";
 import { SessionManager } from "./session-manager";
@@ -36,6 +37,7 @@ let profiles: ProfileManager;
 let browserSignIn: BrowserSignIn;
 let sessionManager: SessionManager;
 let extensionContext: vscode.ExtensionContext;
+let logger: Logger;
 let claudeWatcher: ClaudeCodeWatcher | undefined;
 let codexWatcher: CodexWatcher | undefined;
 let taskWatcher: TaskWatcher | undefined;
@@ -105,6 +107,9 @@ function claudeWorkspaceRootForFile(filePath: string): string | null | undefined
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   console.log(`[aidrift] activating v${VERSION}`);
   extensionContext = context;
+  logger = createOutputLogger();
+  context.subscriptions.push({ dispose: () => logger.dispose() });
+  logger.info("activate", { version: VERSION });
   profiles = new ProfileManager(context);
   await profiles.init();
   context.subscriptions.push({ dispose: () => profiles.dispose() });
@@ -123,7 +128,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     sessionManager.reset();
     await refreshSignInState();
   });
-  sessionManager = new SessionManager(apiClient);
+  sessionManager = new SessionManager(apiClient, logger, () => {
+    void vscode.window
+      .showWarningMessage(
+        "AI Drift can't upload chats — your session may have expired. Sign in again to resume tracking.",
+        "Sign in",
+        "Dismiss",
+      )
+      .then((choice) => {
+        if (choice === "Sign in") {
+          void vscode.commands.executeCommand("aidrift.login");
+        }
+      });
+  });
   sessionManager.start();
   context.subscriptions.push({ dispose: () => sessionManager.stop() });
 
@@ -274,6 +291,7 @@ async function startWatchers(): Promise<void> {
         return sessionManager.handleEntry(entry, "claude-code", workspacePath ?? undefined);
       },
       makeWatcherPersistence("aidrift.watcher.claude.offsets"),
+      logger,
     );
     try {
       await claudeWatcher.start();
@@ -291,6 +309,7 @@ async function startWatchers(): Promise<void> {
         return sessionManager.handleEntry(entry, "codex", workspacePath);
       },
       makeWatcherPersistence("aidrift.watcher.codex.offsets"),
+      logger,
     );
     try {
       await codexWatcher.start();
@@ -539,6 +558,8 @@ async function rescanClaudeHistoryFlow(): Promise<void> {
         let lastPct = 0;
         await claudeWatcher!.rescanFromScratch({
           concurrency: 4,
+          // Explicit user command — pull in dormant transcripts too.
+          includeDormant: true,
           onProgress: (done, total) => {
             if (token.isCancellationRequested) return;
             const pct = Math.floor((done / total) * 100);
