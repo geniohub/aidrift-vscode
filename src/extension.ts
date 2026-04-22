@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { execFile } from "node:child_process";
-import { normalize } from "node:path";
+import { homedir } from "node:os";
+import { join, normalize } from "node:path";
 import { promisify } from "node:util";
 const VERSION: string =
   vscode.extensions.getExtension("GenioHub.aidrift")?.packageJSON.version ?? "dev";
@@ -542,37 +543,70 @@ async function rescanClaudeHistoryFlow(): Promise<void> {
     );
     return;
   }
+  // Rescan is always scoped to the active VSCode workspace folder(s).
+  // Walking every project under ~/.claude/projects/ replays transcripts from
+  // unrelated folders and wastes API round-trips; intentionally unsupported.
+  const roots = workspaceRoots();
+  if (roots.length === 0) {
+    void vscode.window.showWarningMessage(
+      "AI Drift: open a workspace folder before rescanning — rescan is scoped to the current folder.",
+    );
+    return;
+  }
+  const claudeRoot = join(homedir(), ".claude", "projects");
+  const scopeDirs = roots.map((r) => join(claudeRoot, claudeProjectSlugFromWorkspacePath(r)));
+  const scopeLabel =
+    roots.length === 1 ? `workspace ${roots[0]}` : `${roots.length} workspace folders`;
   // Push through the history faster: raise HTTP concurrency for the duration
   // of the rescan. The api-client still honors server 429s, so the server
   // backpressures us if we overshoot. 16 is an order of magnitude above
   // normal operation and empirically plenty for a cold re-ingest.
   const restoreConcurrency = setMaxConcurrentRequests(16);
   try {
-    await vscode.window.withProgress(
+    const cancelled = await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
-        title: "AI Drift: rescanning Claude Code history",
+        title: `AI Drift: rescanning ${scopeLabel}`,
         cancellable: true,
       },
       async (progress, token) => {
-        let lastPct = 0;
-        await claudeWatcher!.rescanFromScratch({
-          concurrency: 4,
-          // Explicit user command — pull in dormant transcripts too.
-          includeDormant: true,
-          onProgress: (done, total) => {
-            if (token.isCancellationRequested) return;
-            const pct = Math.floor((done / total) * 100);
-            const inc = pct - lastPct;
-            lastPct = pct;
-            progress.report({ increment: inc, message: `${done}/${total} files (${pct}%)` });
-          },
+        const controller = new AbortController();
+        const cancelSub = token.onCancellationRequested(() => {
+          controller.abort();
+          // Drop every queued flush + unsettled turn so the 30s implicit-
+          // accept sweep doesn't keep firing PATCHes for the backlog the
+          // rescan already enqueued.
+          sessionManager.cancelPendingWork();
         });
-        progress.report({ message: "flushing pending turns…" });
-        await sessionManager.drainPending();
+        let lastPct = 0;
+        try {
+          await claudeWatcher!.rescanFromScratch({
+            concurrency: 4,
+            // Explicit user command — pull in dormant transcripts too.
+            includeDormant: true,
+            scopeDirs,
+            signal: controller.signal,
+            onProgress: (done, total) => {
+              if (token.isCancellationRequested) return;
+              const pct = total > 0 ? Math.floor((done / total) * 100) : 100;
+              const inc = pct - lastPct;
+              lastPct = pct;
+              progress.report({ increment: inc, message: `${done}/${total} files (${pct}%)` });
+            },
+          });
+          if (!token.isCancellationRequested) {
+            progress.report({ message: "flushing pending turns…" });
+            await sessionManager.drainPending();
+          }
+        } finally {
+          cancelSub.dispose();
+        }
+        return token.isCancellationRequested;
       },
     );
-    void vscode.window.showInformationMessage("AI Drift: rescan complete.");
+    void vscode.window.showInformationMessage(
+      cancelled ? "AI Drift: rescan cancelled." : "AI Drift: rescan complete.",
+    );
   } catch (err) {
     void vscode.window.showErrorMessage(`AI Drift rescan failed: ${err instanceof Error ? err.message : String(err)}`);
   } finally {

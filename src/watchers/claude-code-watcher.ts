@@ -18,6 +18,15 @@ export interface IngestOpts {
   // older transcripts on demand. False (default) skips files whose mtime
   // is older than DORMANT_MTIME_MS.
   includeDormant?: boolean;
+  // If set, restrict the scan to these absolute directory paths (walked
+  // recursively). Unset/empty = walk the full ~/.claude/projects/ root.
+  // Used by the "Rescan Active Workspace" command to avoid replaying every
+  // project's transcripts when the user only cares about the current folder.
+  scopeDirs?: string[];
+  // When flipped, workers stop picking up new files. Partial in-flight
+  // ingests finish (their byte ranges are small), but the remaining files
+  // are skipped so the user can actually cancel a rescan.
+  signal?: AbortSignal;
 }
 
 export interface WatcherLog {
@@ -131,7 +140,12 @@ export class ClaudeCodeWatcher {
   }
 
   private async ingestExistingFiles(opts?: IngestOpts): Promise<void> {
-    const all = await this.listJsonlFiles(this.rootDir);
+    const scopeDirs = opts?.scopeDirs?.filter(Boolean) ?? [];
+    const roots = scopeDirs.length > 0 ? scopeDirs : [this.rootDir];
+    const all: Array<{ path: string; mtimeMs: number }> = [];
+    for (const root of roots) {
+      all.push(...(await this.listJsonlFiles(root)));
+    }
     const includeDormant = opts?.includeDormant ?? false;
     const now = Date.now();
     // Always keep files we already have an offset for — skipping them would
@@ -155,10 +169,12 @@ export class ClaudeCodeWatcher {
     });
     const concurrency = Math.max(1, opts?.concurrency ?? 1);
     const onProgress = opts?.onProgress;
+    const signal = opts?.signal;
     let done = 0;
     let cursor = 0;
     const worker = async () => {
       while (cursor < files.length) {
+        if (signal?.aborted) return;
         const idx = cursor++;
         const filePath = files[idx];
         if (!filePath) continue;
@@ -227,14 +243,29 @@ export class ClaudeCodeWatcher {
   }
 
   /**
-   * Drop all byte offsets (in-memory + persisted) and re-walk every JSONL
-   * from byte 0. Server-side dedup on (sessionId, userPromptUuid) keeps the
-   * replay idempotent. Used by the `aidrift.rescanClaudeHistory` command to
+   * Drop byte offsets (in-memory + persisted) and re-walk JSONLs from byte 0.
+   * Server-side dedup on (sessionId, userPromptUuid) keeps the replay
+   * idempotent. Used by the `aidrift.rescanClaudeHistory*` commands to
    * recover sessions that a prior (buggy) extension version dropped silently.
+   *
+   * If `opts.scopeDirs` is set, only offsets for files *under* those dirs
+   * are cleared — offsets for other projects are preserved so their next
+   * append still picks up from the right byte. Without scope, all offsets
+   * are dropped.
    */
   async rescanFromScratch(opts?: IngestOpts): Promise<void> {
-    this.offsets.clear();
-    this.persistence?.save({});
+    const scopeDirs = opts?.scopeDirs?.filter(Boolean) ?? [];
+    if (scopeDirs.length === 0) {
+      this.offsets.clear();
+      this.persistence?.save({});
+    } else {
+      for (const p of Array.from(this.offsets.keys())) {
+        if (scopeDirs.some((dir) => p === dir || p.startsWith(`${dir}/`))) {
+          this.offsets.delete(p);
+        }
+      }
+      this.persistence?.save(Object.fromEntries(this.offsets));
+    }
     await this.ingestExistingFiles(opts);
   }
 

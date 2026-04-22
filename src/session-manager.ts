@@ -527,6 +527,20 @@ export class SessionManager {
   }
 
   /**
+   * Drop every pending pair, debounce timer, and unsettled turn. Used when
+   * the user cancels a rescan — without this, the backlog (POSTs debounced
+   * for 1.2s, and the 30s implicit-accept sweep retrying 429'd PATCHes)
+   * keeps hammering the API long after "Cancel" is clicked.
+   */
+  cancelPendingWork(): void {
+    for (const timer of this.pendingFlushTimers.values()) clearTimeout(timer);
+    this.pendingFlushTimers.clear();
+    this.pending.clear();
+    this.unsettled.clear();
+    this.log?.info("session manager cancelled pending work");
+  }
+
+  /**
    * Flush every sessionHint with a pending pair, immediately — cancels
    * the debounce timers and awaits all POSTs. Used at the tail of a rescan
    * so we don't leave the last pair of each transcript dangling for 1.2s.
