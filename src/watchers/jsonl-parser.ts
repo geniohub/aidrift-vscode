@@ -115,6 +115,7 @@ interface RawEntry {
   timestamp?: string;
   message?: Message;
   userType?: string;
+  isSidechain?: boolean;
 }
 
 const CONTEXT_TAG_RE = /<(?:ide_[a-z_]+|system-reminder|environment_context|context|status|instructions)>[\s\S]*?<\/(?:ide_[a-z_]+|system-reminder|environment_context|context|status|instructions)>/gi;
@@ -325,6 +326,11 @@ export function parseLine(line: string): ParsedEntry {
   } catch {
     return { kind: "skip" };
   }
+
+  // Sub-agent (Task/Agent) transcripts live in {parent}/subagents/*.jsonl and
+  // carry the parent's sessionId, so their entries would otherwise be posted
+  // against the parent's server session. Skip until nested tracking lands.
+  if (raw.isSidechain === true) return { kind: "skip" };
 
   if (raw.type === "ai-title" && raw.sessionId) {
     const title = (raw as unknown as Record<string, unknown>).aiTitle;
