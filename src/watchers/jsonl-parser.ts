@@ -118,7 +118,7 @@ interface RawEntry {
   isSidechain?: boolean;
 }
 
-const CONTEXT_TAG_RE = /<(?:ide_[a-z_]+|system-reminder|environment_context|context|status|instructions)>[\s\S]*?<\/(?:ide_[a-z_]+|system-reminder|environment_context|context|status|instructions)>/gi;
+const CONTEXT_TAG_RE = /<(?:ide_[a-z_]+|system-reminder|environment_context|context|status|instructions|local-command-(?:caveat|stdout|stderr)|command-(?:name|message|args|stdout|stderr))>[\s\S]*?<\/(?:ide_[a-z_]+|system-reminder|environment_context|context|status|instructions|local-command-(?:caveat|stdout|stderr)|command-(?:name|message|args|stdout|stderr))>/gi;
 
 export function stripIdeTags(text: string): string {
   return text.replace(CONTEXT_TAG_RE, "").trim();
