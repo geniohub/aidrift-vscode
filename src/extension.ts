@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { execFile } from "node:child_process";
+import { promises as fsp } from "node:fs";
 import { homedir } from "node:os";
 import { join, normalize } from "node:path";
 import { promisify } from "node:util";
@@ -89,20 +90,54 @@ function claudeProjectSlugFromFile(filePath: string): string | undefined {
   return slug;
 }
 
-// Return semantics:
-//   string    — ingest and tag the session with this workspace root.
-//   null      — ingest, but no workspace root available (no roots open, or the
-//               jsonl's project slug doesn't match any open root — e.g. user
-//               launched `claude` from AiDrift while the VSCode window is
-//               rooted elsewhere). Server-side dedup on (userId, sessionHint)
-//               keeps a second window from creating duplicates.
-//   undefined — skip entirely (slug couldn't be derived; defensive).
-function claudeWorkspaceRootForFile(filePath: string): string | null | undefined {
-  const roots = workspaceRoots();
-  if (roots.length === 0) return null;
+// Decode a Claude Code project slug (e.g. "-Users-alper-workdir-AiDrift") back
+// into a filesystem path by walking the directory tree — names containing "-"
+// or "_" are ambiguous under the encoding, so we resolve by checking which
+// candidate path actually exists.
+async function decodeProjectSlug(slug: string): Promise<string | undefined> {
+  if (!slug.startsWith("-")) return undefined;
+  const parts = slug.slice(1).split("-");
+  const result = await resolveSlugParts("/", parts, 0);
+  return result ?? undefined;
+}
+
+async function resolveSlugParts(
+  current: string,
+  parts: string[],
+  idx: number,
+): Promise<string | null> {
+  if (idx >= parts.length) {
+    const stat = await fsp.stat(current).catch(() => null);
+    return stat?.isDirectory() ? current : null;
+  }
+  for (let end = idx; end < parts.length; end++) {
+    const segment = parts.slice(idx, end + 1).join("-");
+    const candidates = [segment];
+    if (segment.includes("-")) candidates.push(segment.replace(/-/g, "_"));
+    for (const c of candidates) {
+      const candidate = join(current, c);
+      const stat = await fsp.stat(candidate).catch(() => null);
+      if (!stat?.isDirectory()) continue;
+      const resolved = await resolveSlugParts(candidate, parts, end + 1);
+      if (resolved) return resolved;
+    }
+  }
+  return null;
+}
+
+// Resolve the workspace root for a Claude Code transcript file.
+// Prefers an open VSCode root whose slug matches, otherwise decodes the slug
+// against the filesystem. Returns `undefined` only when neither a matching
+// root nor an existing on-disk folder can be found — caller should drop the
+// entry in that case so no session is created without a workspace.
+async function claudeWorkspaceRootForFile(filePath: string): Promise<string | undefined> {
   const slug = claudeProjectSlugFromFile(filePath);
   if (!slug) return undefined;
-  return roots.find((root) => claudeProjectSlugFromWorkspacePath(root) === slug) ?? null;
+  const matched = workspaceRoots().find(
+    (root) => claudeProjectSlugFromWorkspacePath(root) === slug,
+  );
+  if (matched) return matched;
+  return await decodeProjectSlug(slug);
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -286,10 +321,12 @@ async function startWatchers(): Promise<void> {
   const cfg = vscode.workspace.getConfiguration("aidrift");
   if (!claudeWatcher && cfg.get<boolean>("watchClaudeCode", true)) {
     claudeWatcher = new ClaudeCodeWatcher(
-      (entry, filePath) => {
-        const workspacePath = claudeWorkspaceRootForFile(filePath);
-        if (workspacePath === undefined) return Promise.resolve();
-        return sessionManager.handleEntry(entry, "claude-code", workspacePath ?? undefined);
+      async (entry, filePath) => {
+        const workspacePath = await claudeWorkspaceRootForFile(filePath);
+        // No resolvable workspace (slug can't be decoded to an existing folder)
+        // — drop rather than ingest a session with null workspacePath.
+        if (!workspacePath) return;
+        await sessionManager.handleEntry(entry, "claude-code", workspacePath);
       },
       makeWatcherPersistence("aidrift.watcher.claude.offsets"),
       logger,
@@ -305,8 +342,17 @@ async function startWatchers(): Promise<void> {
   if (!codexWatcher && cfg.get<boolean>("watchCodex", true)) {
     codexWatcher = new CodexWatcher(
       (entry) => {
-        const workspacePath = (entry.kind === "skip" || entry.kind === "ai-title" || entry.kind === "tool-results") ? undefined : entry.workspacePath;
-        if (!isInActiveWorkspace(workspacePath)) return Promise.resolve();
+        // skip/ai-title/tool-results only patch existing sessions — they don't
+        // carry a workspace and shouldn't need one.
+        const lookupOnly =
+          entry.kind === "skip" || entry.kind === "ai-title" || entry.kind === "tool-results";
+        const workspacePath = lookupOnly ? undefined : entry.workspacePath;
+        if (!lookupOnly) {
+          // Session-creating kinds (user-prompt, assistant-reply) must have a
+          // workspace: drop rather than insert a null-workspace row.
+          if (!workspacePath) return Promise.resolve();
+          if (!isInActiveWorkspace(workspacePath)) return Promise.resolve();
+        }
         return sessionManager.handleEntry(entry, "codex", workspacePath);
       },
       makeWatcherPersistence("aidrift.watcher.codex.offsets"),
