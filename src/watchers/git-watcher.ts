@@ -38,6 +38,13 @@ export class GitWatcher {
   private lastHeadCommit = new Map<string, string>(); // branch → hash
   private lastRemoteCommit = new Map<string, string>(); // remote/branch → hash
 
+  private readonly _onDidProcessCommit = new vscode.EventEmitter<{
+    root: string;
+    branch: string;
+    sha: string;
+  }>();
+  readonly onDidProcessCommit = this._onDidProcessCommit.event;
+
   constructor(
     private readonly api: ApiClient,
     private readonly getSessionId: SessionIdGetter,
@@ -90,6 +97,7 @@ export class GitWatcher {
     this.headWatchers = [];
     for (const w of this.remoteWatchers) await w.close();
     this.remoteWatchers = [];
+    this._onDidProcessCommit.dispose();
   }
 
   private debounce(key: string, fn: () => void): void {
@@ -166,7 +174,7 @@ export class GitWatcher {
       turnId: this.getLastTurnId() ?? undefined,
     };
 
-    await this.postGitEvent(payload);
+    await this.postGitEvent(payload, root);
   }
 
   private async onBranchCreate(root: string, filePath: string): Promise<void> {
@@ -264,7 +272,7 @@ export class GitWatcher {
     return aiPatterns.some((p) => p.test(message));
   }
 
-  private async postGitEvent(payload: GitEventPayload): Promise<void> {
+  private async postGitEvent(payload: GitEventPayload, root?: string): Promise<void> {
     const sessionId = this.getSessionId();
     if (!sessionId) return;
 
@@ -274,6 +282,13 @@ export class GitWatcher {
         body: JSON.stringify(payload),
       });
       console.log(`[aidrift] git event posted: ${payload.type} ${payload.commitShort ?? payload.branch}`);
+      if (payload.type === "commit" && payload.commitHash) {
+        this._onDidProcessCommit.fire({
+          root: root ?? "",
+          branch: payload.branch,
+          sha: payload.commitHash,
+        });
+      }
     } catch (err) {
       console.error("[aidrift] failed to post git event:", err);
     }
