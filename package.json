@@ -135,6 +135,11 @@
       {
         "command": "aidrift.showCurrentProfile",
         "title": "Drift: Show Current Profile"
+      },
+      {
+        "command": "aidrift.commitLog.refresh",
+        "title": "Drift: Refresh Commit Log",
+        "icon": "$(refresh)"
       }
     ],
     "viewsContainers": {
@@ -151,6 +156,10 @@
         {
           "id": "aidrift.sessions",
           "name": "Recent Sessions"
+        },
+        {
+          "id": "aidrift.commitLog",
+          "name": "Commit Log"
         }
       ]
     },
@@ -165,6 +174,11 @@
           "command": "aidrift.refreshSessions",
           "when": "view == aidrift.sessions",
           "group": "navigation@2"
+        },
+        {
+          "command": "aidrift.commitLog.refresh",
+          "when": "view == aidrift.commitLog",
+          "group": "navigation@1"
         }
       ]
     },
@@ -275,6 +289,18 @@
           "minimum": 1,
           "maximum": 500,
           "description": "Maximum number of recent sessions to fetch for the AI Drift sidebar. Sessions are filtered to the current workspace after fetching, so the visible count may be lower. Use the sidebar's 🔍 Search Sessions command to find older sessions beyond this limit."
+        },
+        "aidrift.commitLog.limit": {
+          "type": "integer",
+          "default": 100,
+          "minimum": 10,
+          "maximum": 500,
+          "description": "Number of recent commits shown in the AI Drift commit-log view."
+        },
+        "aidrift.commitLog.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the AI Drift commit-log view in the sidebar."
         }
       }
     }
