@@ -281,7 +281,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "lint": "tsc -p tsconfig.json --noEmit",
+    "lint": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node20 --minify",
     "package": "pnpm bundle && vsce package --no-dependencies",
     "watch": "tsc -p tsconfig.json --watch",
