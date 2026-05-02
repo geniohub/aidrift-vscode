@@ -9,8 +9,55 @@
 import * as vscode from "vscode";
 import type { ApiClient } from "../api-client";
 import { openDiffInVscode } from "../diff-handler";
+import {
+  evaluateLocalPredicates,
+  getCurrentHeadSha,
+  resetHard,
+  revertRange,
+  stashWorkingTree,
+  type LocalPredicates,
+} from "../revert-predicates";
 
 const POLL_INTERVAL_MS = 5_000;
+
+// Six-axis "fits" predicate set (Phase 5 / Phase 6 of Git Provenance).
+// `value === true` is the only state that counts as a pass — null is
+// "couldn't determine", and the all-green gate requires explicit true.
+type PredicateState = {
+  value: boolean | null;
+  source: "server" | "client";
+  note: string;
+};
+
+interface MergedPredicates {
+  workingTreeClean: PredicateState;
+  targetExists: PredicateState;
+  noUnpushedBetween: PredicateState;
+  noPushedBetween: PredicateState;
+  leaksAtTarget: PredicateState;
+  scopeImproves: PredicateState;
+}
+
+interface RevertDialogState {
+  sha: string;
+  shortSha: string;
+  subject: string | null;
+  branch: string;
+  fromSha: string | null; // current HEAD when dialog opened
+  predicates: MergedPredicates;
+  fits: boolean;
+  // "reset" means `git reset --hard <sha>` is appropriate (no pushed
+  // commits in target..HEAD); "revert" means `git revert <sha>..HEAD`
+  // because pushed history would otherwise diverge.
+  suggestedMethod: "reset" | "revert";
+  suggestedCommand: string;
+  workingTreeWasDirty: boolean;
+  loading: boolean;
+  errors: string[];
+  // Set while the actual git op is running so the UI can disable the
+  // button without the user being able to double-click.
+  executing: boolean;
+}
 
 interface SessionDto {
   id: string;
@@ -73,6 +120,7 @@ interface PanelData {
   scores: ScoreDto[];
   commits: GitEventDto[];
   error: string | null;
+  revertDialog: RevertDialogState | null;
 }
 
 export interface PanelDeps {
@@ -106,7 +154,14 @@ export class SessionDetailPanel {
   private readonly disposables: vscode.Disposable[] = [];
   private pollTimer: NodeJS.Timeout | undefined;
   private lastFetchedTurnCount: number | null = null;
-  private data: PanelData = { status: null, turns: [], scores: [], commits: [], error: null };
+  private data: PanelData = {
+    status: null,
+    turns: [],
+    scores: [],
+    commits: [],
+    error: null,
+    revertDialog: null,
+  };
 
   private constructor(
     private readonly sessionId: string,
@@ -164,7 +219,16 @@ export class SessionDetailPanel {
         : this.data.turns;
       if (shouldRefreshTurns) this.lastFetchedTurnCount = status.turnCount;
 
-      this.data = { status, turns, scores, commits, error: null };
+      // Preserve any open revert dialog across polls so a slow git op
+      // doesn't get its UI yanked out from under the user.
+      this.data = {
+        status,
+        turns,
+        scores,
+        commits,
+        error: null,
+        revertDialog: this.data.revertDialog,
+      };
       if (status?.session?.taskDescription) {
         this.panel.title = shortTitle(status.session.taskDescription);
       }
@@ -216,7 +280,223 @@ export class SessionDetailPanel {
         await this.refresh(true);
         return;
       }
+      case "open-revert": {
+        const sha = String(m.payload?.sha ?? "");
+        if (!sha) return;
+        await this.openRevertDialog(sha);
+        return;
+      }
+      case "close-revert": {
+        if (this.data.revertDialog?.executing) return;
+        this.data = { ...this.data, revertDialog: null };
+        this.post();
+        return;
+      }
+      case "copy-revert-command": {
+        const cmd = String(m.payload?.command ?? "");
+        if (!cmd) return;
+        await vscode.env.clipboard.writeText(cmd);
+        void vscode.window.showInformationMessage(
+          `AI Drift: copied — ${cmd}`,
+        );
+        return;
+      }
+      case "execute-revert": {
+        await this.executeRevert();
+        return;
+      }
     }
+  }
+
+  // Resolves the cwd for git ops. Prefers session.workspacePath when it
+  // matches an open workspace folder; falls back to the first folder.
+  private resolveGitCwd(): string | null {
+    const roots = this.deps.workspaceRoots();
+    const sessionPath = this.data.status?.session?.workspacePath;
+    if (sessionPath && roots.includes(sessionPath)) return sessionPath;
+    return roots[0] ?? null;
+  }
+
+  private async openRevertDialog(sha: string): Promise<void> {
+    const cwd = this.resolveGitCwd();
+    if (!cwd) {
+      void vscode.window.showWarningMessage(
+        "AI Drift: no workspace folder open — can't run git locally for the revert preview.",
+      );
+      return;
+    }
+
+    // Show the dialog in a loading state immediately so the user gets
+    // feedback while the API + git calls run.
+    this.data = {
+      ...this.data,
+      revertDialog: {
+        sha,
+        shortSha: sha.slice(0, 7),
+        subject: null,
+        branch: "",
+        fromSha: null,
+        predicates: emptyPredicates(),
+        fits: false,
+        suggestedMethod: "reset",
+        suggestedCommand: `git reset --hard ${sha}`,
+        workingTreeWasDirty: false,
+        loading: true,
+        errors: [],
+        executing: false,
+      },
+    };
+    this.post();
+
+    let serverPreview: ServerPreview | null = null;
+    let preview: LocalPredicates;
+    let headSha: string | null;
+    const errors: string[] = [];
+    try {
+      [serverPreview, preview, headSha] = await Promise.all([
+        this.deps.api
+          .request<ServerPreview>(`/commits/${sha}/revert-preview`)
+          .catch((e: Error) => {
+            errors.push(`server preview: ${e.message}`);
+            return null;
+          }),
+        evaluateLocalPredicates(cwd, sha),
+        getCurrentHeadSha(cwd),
+      ]);
+    } catch (err) {
+      errors.push(`unexpected: ${(err as Error).message}`);
+      preview = {
+        workingTreeClean: null,
+        targetExists: null,
+        noUnpushedBetween: null,
+        noPushedBetween: null,
+        hasUpstream: false,
+        errors: [],
+      };
+      headSha = null;
+    }
+    errors.push(...preview.errors);
+
+    const merged = mergePredicates(serverPreview, preview);
+    const fits = predicateValues(merged).every((p) => p.value === true);
+    const suggestedMethod: "reset" | "revert" =
+      merged.noPushedBetween.value === false ? "revert" : "reset";
+    const suggestedCommand =
+      suggestedMethod === "reset"
+        ? `git reset --hard ${sha}`
+        : `git revert --no-edit ${sha}..HEAD`;
+
+    this.data = {
+      ...this.data,
+      revertDialog: {
+        sha,
+        shortSha: serverPreview?.target.shortSha ?? sha.slice(0, 7),
+        subject: serverPreview?.target.subject ?? null,
+        branch: serverPreview?.target.branch ?? "",
+        fromSha: headSha,
+        predicates: merged,
+        fits,
+        suggestedMethod,
+        suggestedCommand,
+        workingTreeWasDirty: preview.workingTreeClean === false,
+        loading: false,
+        errors,
+        executing: false,
+      },
+    };
+    this.post();
+  }
+
+  private async executeRevert(): Promise<void> {
+    const dlg = this.data.revertDialog;
+    if (!dlg || !dlg.fits || dlg.executing) return;
+    if (!dlg.fromSha) {
+      void vscode.window.showErrorMessage(
+        "AI Drift: couldn't read current HEAD — refusing to revert.",
+      );
+      return;
+    }
+    const cwd = this.resolveGitCwd();
+    if (!cwd) {
+      void vscode.window.showErrorMessage(
+        "AI Drift: no workspace folder — can't execute git locally.",
+      );
+      return;
+    }
+
+    const confirmLabel =
+      dlg.suggestedMethod === "reset" ? "Reset" : "Revert";
+    const confirmDetail =
+      dlg.suggestedMethod === "reset"
+        ? `Will run: git reset --hard ${dlg.shortSha} (discards commits after the target).`
+        : `Will run: git revert --no-edit ${dlg.shortSha}..HEAD (creates revert commits, history preserved).`;
+    const choice = await vscode.window.showWarningMessage(
+      `Revert workspace to ${dlg.shortSha}?`,
+      { modal: true, detail: confirmDetail },
+      confirmLabel,
+    );
+    if (choice !== confirmLabel) return;
+
+    this.data = {
+      ...this.data,
+      revertDialog: { ...dlg, executing: true },
+    };
+    this.post();
+
+    let methodExecuted: "reset" | "revert" | "stash+reset" | "stash+revert" =
+      dlg.suggestedMethod;
+    try {
+      if (dlg.workingTreeWasDirty) {
+        const stashLabel = `aidrift pre-revert ${dlg.shortSha} ${new Date().toISOString()}`;
+        await stashWorkingTree(cwd, stashLabel);
+        methodExecuted = dlg.suggestedMethod === "reset" ? "stash+reset" : "stash+revert";
+      }
+      if (dlg.suggestedMethod === "reset") {
+        await resetHard(cwd, dlg.sha);
+      } else {
+        await revertRange(cwd, dlg.sha);
+      }
+    } catch (err) {
+      this.data = {
+        ...this.data,
+        revertDialog: { ...dlg, executing: false, errors: [...dlg.errors, `revert failed: ${(err as Error).message}`] },
+      };
+      this.post();
+      void vscode.window.showErrorMessage(
+        `AI Drift: revert failed — ${(err as Error).message}`,
+      );
+      return;
+    }
+
+    // Best-effort POST. Failure here doesn't block the user — the git op
+    // already succeeded; we just lose one DAG row.
+    try {
+      await this.deps.api.request("/commits/" + dlg.sha + "/revert-event", {
+        method: "POST",
+        body: JSON.stringify({
+          sessionId: this.sessionId,
+          fromSha: dlg.fromSha,
+          toSha: dlg.sha,
+          method: methodExecuted,
+          workingTreeWasDirty: dlg.workingTreeWasDirty,
+          predicateSnapshot: snapshotFromPredicates(dlg.predicates),
+        }),
+      });
+    } catch (err) {
+      void vscode.window.showWarningMessage(
+        `AI Drift: revert ran, but couldn't record the event — ${(err as Error).message}`,
+      );
+    }
+
+    void vscode.window.showInformationMessage(
+      methodExecuted.startsWith("stash+")
+        ? `AI Drift: stashed working tree, then ${dlg.suggestedMethod === "reset" ? "reset --hard" : "reverted"} to ${dlg.shortSha}.`
+        : `AI Drift: ${dlg.suggestedMethod === "reset" ? "reset --hard" : "reverted"} to ${dlg.shortSha}.`,
+    );
+
+    this.data = { ...this.data, revertDialog: null };
+    this.post();
+    await this.refresh(true);
   }
 
   private async openFile(filePath: string): Promise<void> {
@@ -338,9 +618,78 @@ export class SessionDetailPanel {
   .commit-sha:hover { text-decoration: underline; }
   .commit-msg { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .commit-stat { color: var(--vscode-descriptionForeground); font-size: 0.85em; font-variant-numeric: tabular-nums; }
+  .commit-actions { display: flex; gap: 4px; }
+  .commit button.btn-revert { padding: 1px 8px; font-size: 0.85em; }
   .spinner { color: var(--vscode-descriptionForeground); font-style: italic; padding: 12px 0; }
   .error { color: var(--vscode-errorForeground); padding: 8px 10px; background: var(--vscode-inputValidation-errorBackground); border: 1px solid var(--vscode-inputValidation-errorBorder); border-radius: 3px; }
   .empty { color: var(--vscode-descriptionForeground); font-style: italic; padding: 8px 0; }
+  /* Revert dialog — modal-style overlay rendered in the webview itself
+     so we don't need a second panel just to host the safety radar. */
+  .revert-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 100;
+  }
+  .revert-modal {
+    background: var(--vscode-editor-background);
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 6px;
+    padding: 16px 18px;
+    width: min(560px, 92vw);
+    max-height: 90vh; overflow: auto;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
+  }
+  .revert-modal h3 { margin: 0 0 4px; font-size: 1em; font-weight: 600; }
+  .revert-modal .subtitle { color: var(--vscode-descriptionForeground); font-size: 0.85em; margin-bottom: 12px; }
+  .revert-modal .radar-row { display: flex; gap: 16px; align-items: flex-start; margin-bottom: 12px; }
+  .revert-modal .radar { flex: 0 0 200px; }
+  .revert-modal .pred-list { flex: 1; min-width: 0; font-size: 0.85em; }
+  .revert-modal .pred-list .pred {
+    display: flex; gap: 6px; align-items: flex-start; padding: 3px 0;
+  }
+  .revert-modal .pred-dot {
+    flex: 0 0 8px; width: 8px; height: 8px; border-radius: 50%;
+    margin-top: 6px;
+  }
+  .pred-dot.pass { background: var(--vscode-testing-iconPassed, #3fb950); }
+  .pred-dot.fail { background: var(--vscode-editorError-foreground, #f85149); }
+  .pred-dot.unknown { background: var(--vscode-descriptionForeground); opacity: 0.5; }
+  .revert-modal .pred-name { font-weight: 600; min-width: 130px; }
+  .revert-modal .pred-note { color: var(--vscode-descriptionForeground); flex: 1; }
+  .revert-modal .verdict {
+    margin: 8px 0 12px; padding: 6px 10px; border-radius: 3px;
+    font-size: 0.9em;
+  }
+  .revert-modal .verdict.fits {
+    background: color-mix(in srgb, var(--vscode-testing-iconPassed, #3fb950) 18%, transparent);
+  }
+  .revert-modal .verdict.unsafe {
+    background: var(--vscode-inputValidation-warningBackground);
+    border: 1px solid var(--vscode-inputValidation-warningBorder);
+    color: var(--vscode-inputValidation-warningForeground);
+  }
+  .revert-modal .cmd-row {
+    display: flex; gap: 6px; align-items: center;
+    background: var(--vscode-textCodeBlock-background, var(--vscode-editor-background));
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 3px;
+    padding: 4px 8px; margin-bottom: 12px;
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 0.85em;
+  }
+  .revert-modal .cmd-row code { flex: 1; overflow-x: auto; white-space: nowrap; }
+  .revert-modal .errors {
+    margin: 0 0 10px; padding: 6px 10px;
+    background: var(--vscode-inputValidation-errorBackground);
+    border: 1px solid var(--vscode-inputValidation-errorBorder);
+    border-radius: 3px; font-size: 0.85em;
+    color: var(--vscode-errorForeground);
+  }
+  .revert-modal .actions { display: flex; gap: 6px; justify-content: flex-end; }
+  .revert-modal .actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .revert-modal .loading { padding: 24px; text-align: center; color: var(--vscode-descriptionForeground); }
+  .radar svg { display: block; }
 </style>
 </head>
 <body>
@@ -406,10 +755,137 @@ export class SessionDetailPanel {
             '<span class="commit-msg" title="' + esc(c.commitMessage ?? '') + '">' + esc(c.commitMessage ?? '(no message)') + '</span>' +
             stat +
             '<span class="commit-stat">' + esc(fmtTime(c.createdAt)) + '</span>' +
+            '<span class="commit-actions"><button class="btn-revert" data-revert-sha="' + esc(toSha) + '" title="Preview revert to this commit">Revert</button></span>' +
             '</div>'
           );
         }).join('');
         return '<h2>Commits</h2>' + items;
+      }
+
+      // Six-axis safety radar. Predicates feed in fixed order so the
+      // hexagon vertices map 1:1 to predicate names. Green = pass,
+      // grey/dim = unknown, red = fail. The polygon rendered inside
+      // the hexagon is the convex hull of the predicate states scaled
+      // to its axis (pass = full radius, fail/unknown = half).
+      function predicateRow(p) {
+        return [
+          { key: 'workingTreeClean',   label: 'Working tree clean',  state: p.workingTreeClean },
+          { key: 'targetExists',       label: 'Target exists',       state: p.targetExists },
+          { key: 'noUnpushedBetween',  label: 'No unpushed between', state: p.noUnpushedBetween },
+          { key: 'noPushedBetween',    label: 'No pushed between',   state: p.noPushedBetween },
+          { key: 'leaksAtTarget',      label: 'No leaks at target',  state: p.leaksAtTarget },
+          { key: 'scopeImproves',      label: 'Scope improves',      state: p.scopeImproves },
+        ];
+      }
+
+      function dotClass(value) {
+        if (value === true) return 'pass';
+        if (value === false) return 'fail';
+        return 'unknown';
+      }
+
+      function renderRadar(p) {
+        const cx = 100, cy = 100, r = 80;
+        const rows = predicateRow(p);
+        // Hexagon vertices, starting at top, clockwise.
+        const points = rows.map((row, i) => {
+          const angle = -Math.PI / 2 + (i * Math.PI * 2) / 6;
+          const scale = row.state.value === true ? 1 : row.state.value === false ? 0.35 : 0.55;
+          const x = cx + Math.cos(angle) * r * scale;
+          const y = cy + Math.sin(angle) * r * scale;
+          const lx = cx + Math.cos(angle) * (r + 14);
+          const ly = cy + Math.sin(angle) * (r + 14);
+          const fill = row.state.value === true
+            ? 'var(--vscode-testing-iconPassed, #3fb950)'
+            : row.state.value === false
+              ? 'var(--vscode-editorError-foreground, #f85149)'
+              : 'var(--vscode-descriptionForeground)';
+          return { x, y, lx, ly, fill, label: row.label, state: row.state };
+        });
+
+        // Background hex grid (3 concentric rings).
+        const ring = (k) => points.map((_, i) => {
+          const angle = -Math.PI / 2 + (i * Math.PI * 2) / 6;
+          return (cx + Math.cos(angle) * r * k) + ',' + (cy + Math.sin(angle) * r * k);
+        }).join(' ');
+
+        const polygon = points.map((p) => p.x + ',' + p.y).join(' ');
+
+        const labels = points.map((p) => {
+          const anchor = p.lx < cx - 1 ? 'end' : p.lx > cx + 1 ? 'start' : 'middle';
+          // Tiny axis labels so the hex stays readable at 200px wide.
+          return '<text x="' + p.lx + '" y="' + p.ly + '" text-anchor="' + anchor + '" dominant-baseline="middle" font-size="9" fill="var(--vscode-descriptionForeground)">' + esc(p.label) + '</text>';
+        }).join('');
+
+        const dots = points.map((p) => {
+          return '<circle cx="' + p.x + '" cy="' + p.y + '" r="4" fill="' + p.fill + '" />';
+        }).join('');
+
+        return (
+          '<svg viewBox="0 0 200 200" width="200" height="200">' +
+          '<polygon points="' + ring(1) + '" fill="none" stroke="var(--vscode-panel-border)" />' +
+          '<polygon points="' + ring(0.66) + '" fill="none" stroke="var(--vscode-panel-border)" opacity="0.6" />' +
+          '<polygon points="' + ring(0.33) + '" fill="none" stroke="var(--vscode-panel-border)" opacity="0.4" />' +
+          '<polygon points="' + polygon + '" fill="color-mix(in srgb, var(--vscode-foreground) 18%, transparent)" stroke="var(--vscode-foreground)" stroke-opacity="0.6" stroke-width="1.2" />' +
+          dots +
+          labels +
+          '</svg>'
+        );
+      }
+
+      function renderRevertDialog(dlg) {
+        if (!dlg) return '';
+        if (dlg.loading) {
+          return (
+            '<div class="revert-backdrop" id="revert-backdrop">' +
+            '<div class="revert-modal">' +
+            '<h3>Revert preview — ' + esc(dlg.shortSha) + '</h3>' +
+            '<div class="loading">Evaluating safety…</div>' +
+            '<div class="actions"><button id="btn-cancel-revert">Cancel</button></div>' +
+            '</div></div>'
+          );
+        }
+        const rows = predicateRow(dlg.predicates);
+        const predList = rows.map((r) =>
+          '<div class="pred">' +
+          '<div class="pred-dot ' + dotClass(r.state.value) + '"></div>' +
+          '<div class="pred-name">' + esc(r.label) + '</div>' +
+          '<div class="pred-note">' + esc(r.state.note || '') + '</div>' +
+          '</div>'
+        ).join('');
+
+        const verdict = dlg.fits
+          ? '<div class="verdict fits">All six predicates pass — safe to revert.</div>'
+          : '<div class="verdict unsafe">One or more predicates failed — Revert is disabled. Use "Copy command" if you want to run it manually.</div>';
+
+        const errs = (dlg.errors && dlg.errors.length > 0)
+          ? '<div class="errors"><strong>Notes:</strong> ' + esc(dlg.errors.join('; ')) + '</div>'
+          : '';
+
+        const subjectLine = dlg.subject
+          ? '<div class="subtitle">' + esc(dlg.subject) + (dlg.branch ? ' · <em>' + esc(dlg.branch) + '</em>' : '') + '</div>'
+          : (dlg.branch ? '<div class="subtitle"><em>' + esc(dlg.branch) + '</em></div>' : '');
+
+        return (
+          '<div class="revert-backdrop" id="revert-backdrop">' +
+          '<div class="revert-modal">' +
+          '<h3>Revert to ' + esc(dlg.shortSha) + '</h3>' +
+          subjectLine +
+          '<div class="radar-row">' +
+          '<div class="radar">' + renderRadar(dlg.predicates) + '</div>' +
+          '<div class="pred-list">' + predList + '</div>' +
+          '</div>' +
+          verdict +
+          '<div class="cmd-row"><code>' + esc(dlg.suggestedCommand) + '</code><button id="btn-copy-revert">Copy</button></div>' +
+          errs +
+          '<div class="actions">' +
+          '<button id="btn-cancel-revert"' + (dlg.executing ? ' disabled' : '') + '>Cancel</button>' +
+          '<button class="primary" id="btn-execute-revert"' + (dlg.fits && !dlg.executing ? '' : ' disabled') + '>' +
+          (dlg.executing ? 'Running…' : (dlg.suggestedMethod === 'reset' ? 'Reset --hard' : 'Revert range')) +
+          '</button>' +
+          '</div>' +
+          '</div></div>'
+        );
       }
 
       function renderTurns(data) {
@@ -452,7 +928,8 @@ export class SessionDetailPanel {
           renderHeader(data) +
           (data.error ? '<div class="error" style="margin-top:10px">Refresh failed: ' + esc(data.error) + '</div>' : '') +
           renderCommits(data.commits) +
-          renderTurns(data);
+          renderTurns(data) +
+          renderRevertDialog(data.revertDialog);
 
         document.getElementById('btn-resume')?.addEventListener('click', () => send('resume-last-file'));
         document.getElementById('btn-reveal')?.addEventListener('click', () => send('reveal-in-sidebar'));
@@ -465,6 +942,25 @@ export class SessionDetailPanel {
             send('open-diff', { fromSha, toSha });
           });
         });
+        document.querySelectorAll('button.btn-revert').forEach((el) => {
+          el.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            const sha = el.getAttribute('data-revert-sha');
+            if (sha) send('open-revert', { sha });
+          });
+        });
+
+        // Revert-dialog wiring (only present when data.revertDialog is set).
+        const dlg = data.revertDialog;
+        if (dlg) {
+          document.getElementById('btn-cancel-revert')?.addEventListener('click', () => send('close-revert'));
+          document.getElementById('btn-copy-revert')?.addEventListener('click', () => send('copy-revert-command', { command: dlg.suggestedCommand }));
+          document.getElementById('btn-execute-revert')?.addEventListener('click', () => send('execute-revert'));
+          document.getElementById('revert-backdrop')?.addEventListener('click', (ev) => {
+            // Click outside the modal closes it (but never while executing).
+            if (ev.target === ev.currentTarget && !dlg.executing) send('close-revert');
+          });
+        }
       }
 
       window.addEventListener('message', (ev) => {
@@ -476,6 +972,137 @@ export class SessionDetailPanel {
 </body>
 </html>`;
   }
+}
+
+// Subset of the server's RevertPreviewDto we actually consume here. Kept
+// loose on purpose — the extension intentionally doesn't depend on
+// @aidrift/core. Renaming a server field becomes a runtime miss instead
+// of a build break, but the panel degrades cleanly via the `errors[]`.
+interface ServerPreview {
+  target: {
+    sha: string;
+    shortSha: string;
+    subject: string | null;
+    branch: string;
+    createdAt: string;
+  };
+  predicates: {
+    workingTreeClean: PredicateState;
+    targetExists: PredicateState;
+    noUnpushedBetween: PredicateState;
+    noPushedBetween: PredicateState;
+    leaksAtTarget: PredicateState;
+    scopeImproves: PredicateState;
+  };
+  fits: boolean;
+  suggestedCommand: string;
+}
+
+function emptyPredicates(): MergedPredicates {
+  const empty: PredicateState = {
+    value: null,
+    source: "client",
+    note: "loading…",
+  };
+  return {
+    workingTreeClean: empty,
+    targetExists: empty,
+    noUnpushedBetween: empty,
+    noPushedBetween: empty,
+    leaksAtTarget: empty,
+    scopeImproves: empty,
+  };
+}
+
+// Merge server-evaluated predicates (5, 6, server-half of 2) with the
+// extension's local checks (1, 3, 4, client-half of 2). Local wins for
+// any predicate the workspace can answer authoritatively.
+function mergePredicates(
+  server: ServerPreview | null,
+  local: LocalPredicates,
+): MergedPredicates {
+  const fallback: PredicateState = {
+    value: null,
+    source: "server",
+    note: "server preview unavailable",
+  };
+  const s = server?.predicates;
+  // Predicate 2: target must exist on the server's GitEvent ledger AND
+  // in the user's actual repo. Combine both as AND with `null` propagating.
+  const targetExists: PredicateState = (() => {
+    const serverTrue = s?.targetExists.value === true;
+    const localVal = local.targetExists;
+    if (serverTrue && localVal === true) {
+      return { value: true, source: "client", note: "target sha present locally and on server" };
+    }
+    if (localVal === false) {
+      return { value: false, source: "client", note: "target sha not found in local repo (may need fetch)" };
+    }
+    if (s && s.targetExists.value === false) {
+      return { value: false, source: "server", note: s.targetExists.note };
+    }
+    return { value: null, source: "client", note: "target existence unverified" };
+  })();
+
+  return {
+    workingTreeClean: {
+      value: local.workingTreeClean,
+      source: "client",
+      note:
+        local.workingTreeClean === true
+          ? "working tree clean"
+          : local.workingTreeClean === false
+            ? "uncommitted changes — will stash before revert"
+            : "couldn't read git status",
+    },
+    targetExists,
+    noUnpushedBetween: {
+      value: local.noUnpushedBetween,
+      source: "client",
+      note:
+        local.noUnpushedBetween === true
+          ? "no unpushed commits between HEAD and target"
+          : local.noUnpushedBetween === false
+            ? "unpushed work between HEAD and target — would be lost by reset"
+            : "couldn't evaluate gap (no upstream?)",
+    },
+    noPushedBetween: {
+      value: local.noPushedBetween,
+      source: "client",
+      note:
+        local.noPushedBetween === true
+          ? local.hasUpstream
+            ? "no pushed commits between HEAD and target"
+            : "branch has no upstream — nothing pushed"
+          : local.noPushedBetween === false
+            ? "pushed commits between HEAD and target — will use git revert (history preserved)"
+            : "couldn't evaluate pushed range",
+    },
+    leaksAtTarget: s?.leaksAtTarget ?? fallback,
+    scopeImproves: s?.scopeImproves ?? fallback,
+  };
+}
+
+function predicateValues(p: MergedPredicates): PredicateState[] {
+  return [
+    p.workingTreeClean,
+    p.targetExists,
+    p.noUnpushedBetween,
+    p.noPushedBetween,
+    p.leaksAtTarget,
+    p.scopeImproves,
+  ];
+}
+
+function snapshotFromPredicates(p: MergedPredicates) {
+  return {
+    workingTreeClean: p.workingTreeClean.value,
+    targetExists: p.targetExists.value,
+    noUnpushedBetween: p.noUnpushedBetween.value,
+    noPushedBetween: p.noPushedBetween.value,
+    leaksAtTarget: p.leaksAtTarget.value,
+    scopeImproves: p.scopeImproves.value,
+  };
 }
 
 function shortTitle(task: string): string {
