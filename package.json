@@ -286,7 +286,7 @@
     "package": "pnpm bundle && vsce package --no-dependencies",
     "watch": "tsc -p tsconfig.json --watch",
     "clean": "rm -rf dist *.vsix",
-    "test": "echo 'no extension tests yet'"
+    "test": "node --import tsx --test tests/**/*.test.ts"
   },
   "dependencies": {
     "chokidar": "^4.0.1"
@@ -296,6 +296,7 @@
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^3.2.1",
     "esbuild": "^0.24.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.6.3"
   }
 }
