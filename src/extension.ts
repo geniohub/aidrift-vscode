@@ -15,6 +15,7 @@ import { StatusPoller } from "./status-poller";
 import { TaskWatcher } from "./task-watcher";
 import { GitWatcher } from "./watchers/git-watcher";
 import { SessionsTreeProvider, type SessionTreeItem } from "./views/sessions-tree";
+import { CommitLogTreeProvider } from "./views/commit-log-view";
 import { runSessionSearch } from "./views/session-search";
 import { registerUriHandler, openDiffInVscode } from "./diff-handler";
 import { reconcileGitCommits } from "./git-reconciler";
@@ -47,6 +48,7 @@ let gitWatcher: GitWatcher | undefined;
 let poller: StatusPoller | undefined;
 let treeProvider: SessionsTreeProvider | undefined;
 let treeView: vscode.TreeView<SessionTreeItem> | undefined;
+let commitLogProvider: CommitLogTreeProvider | undefined;
 
 function normalizeWorkspacePath(p: string): string {
   return normalize(p).replace(/[\\\/]+$/, "");
@@ -204,6 +206,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   treeProvider.startAutoRefresh();
   context.subscriptions.push({ dispose: () => treeProvider?.stopAutoRefresh() });
 
+  const commitLogLimit = vscode.workspace
+    .getConfiguration("aidrift")
+    .get<number>("commitLog.limit", 100);
+  commitLogProvider = new CommitLogTreeProvider(
+    apiClient,
+    () => (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
+    commitLogLimit,
+  );
+  const commitLogView = vscode.window.createTreeView("aidrift.commitLog", {
+    treeDataProvider: commitLogProvider,
+    showCollapseAll: false,
+  });
+  context.subscriptions.push(commitLogView);
+
   context.subscriptions.push(
     vscode.commands.registerCommand("aidrift.login", () => loginChooser()),
     vscode.commands.registerCommand("aidrift.loginWithBrowser", () => browserSignIn.startSignIn()),
@@ -225,6 +241,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand("aidrift.rescanClaudeHistory", () => rescanClaudeHistoryFlow()),
     vscode.commands.registerCommand("aidrift.refreshSessions", () => treeProvider?.refresh()),
+    vscode.commands.registerCommand("aidrift.commitLog.refresh", () => commitLogProvider?.refresh()),
     vscode.commands.registerCommand("aidrift.searchSessions", () => runSessionSearch(apiClient)),
     vscode.commands.registerCommand("aidrift.switchProfile", () => switchProfileFlow()),
     vscode.commands.registerCommand("aidrift.addProfile", () => addProfileFlow()),
@@ -255,6 +272,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await stopWatchers();
     sessionManager.reset();
     treeProvider?.refresh();
+    commitLogProvider?.refresh();
     updateStatusBar();
     if (await apiClient.isSignedIn()) {
       await startWatchers();
@@ -282,6 +300,7 @@ async function refreshSignInState(): Promise<void> {
   await vscode.commands.executeCommand("setContext", "aidrift.signedIn", signedIn);
   updateStatusBar();
   treeProvider?.refresh();
+  commitLogProvider?.refresh();
   if (signedIn) {
     await startWatchers();
   }
@@ -381,6 +400,13 @@ async function startWatchers(): Promise<void> {
     try {
       await gitWatcher.start();
       console.log("[aidrift] Git watcher started");
+      if (commitLogProvider) {
+        extensionContext.subscriptions.push(
+          gitWatcher.onDidProcessCommit(({ sha }) => {
+            commitLogProvider?.refreshOne(sha);
+          }),
+        );
+      }
     } catch (err) {
       console.error("[aidrift] git watcher failed:", err);
       gitWatcher = undefined;
