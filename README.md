@@ -95,6 +95,10 @@ These operate on the currently tracked session (the most recent chat the watcher
 - **Walkthrough `Get Started with AI Drift`** — three steps: sign in, switch profiles, open the view. Available from the VSCode Walkthroughs page.
 - **URI handler** — `vscode://geniohub.aidrift/signin-callback?token=…` is how the browser sign-in delivers the token back. `vscode://geniohub.aidrift/open-diff?...` opens a diff from the dashboard.
 
+### Commit Log (sidebar)
+
+The **Commit Log** view in the AI Drift sidebar shows the last 100 commits on the active branch, annotated with the drift state of the session that produced each commit. Green dots are clean (score ≥ 80), yellow are drifted (< 80), and outlined dots are commits AiDrift didn't observe. Hover for the producing session's task and top focal points; click to open the session in the dashboard.
+
 ## Settings
 
 - `aidrift.watchClaudeCode` (default `true`) — watch `~/.claude/projects/` for transcripts.
