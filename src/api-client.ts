@@ -106,6 +106,35 @@ interface AuthResponse {
   user: { id: string; email: string; createdAt: string };
 }
 
+export interface CommitMetaDto {
+  event: {
+    id: string;
+    commitHash: string | null;
+    branch: string | null;
+    type: string;
+    filesChanged: number | null;
+    aiInitiated: boolean;
+    turnId: string | null;
+    createdAt: string;
+  };
+  session: {
+    id: string;
+    taskDescription: string;
+    provider: string;
+    workspacePath: string | null;
+    startedAt: string;
+    endedAt: string | null;
+  };
+  driftAtCommit: {
+    score: number;
+    trend: "improving" | "stable" | "drifting";
+    scopeDistance: number | null;
+    focalPoints: Array<{ label: string; weight: number }> | null;
+    focalShift: number | null;
+    createdAt: string;
+  } | null;
+}
+
 export class ApiClient {
   constructor(
     private readonly secrets: vscode.SecretStorage,
@@ -319,5 +348,45 @@ export class ApiClient {
     } finally {
       releaseSlot();
     }
+  }
+
+  private async requestRaw(path: string, init: RequestInit = {}): Promise<Response> {
+    const headers = new Headers(init.headers);
+    if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+
+    const pat = await this.secrets.get(this.key("pat"));
+    if (!pat) await this.refreshIfExpiringSoon();
+    const access = pat ?? (await this.secrets.get(this.key("accessToken")));
+    if (access) headers.set("Authorization", `Bearer ${access}`);
+
+    const timeoutMs = this.requestTimeoutMs();
+    const url = `${this.apiBaseUrl()}${path}`;
+
+    await acquireSlot();
+    try {
+      let res = await this.fetchWithTimeout(url, { ...init, headers }, timeoutMs);
+      if (res.status === 401 && !pat && access) {
+        const ok = await this.tryRefresh(true);
+        if (ok) {
+          const newAccess = await this.secrets.get(this.key("accessToken"));
+          if (newAccess) headers.set("Authorization", `Bearer ${newAccess}`);
+          res = await this.fetchWithTimeout(url, { ...init, headers }, timeoutMs);
+        }
+      }
+      return res;
+    } finally {
+      releaseSlot();
+    }
+  }
+
+  async getCommitBySha(sha: string): Promise<CommitMetaDto | null> {
+    // Returns null when the server has no record of this commit (404).
+    // All other non-2xx statuses throw so the caller can surface them.
+    const res = await this.requestRaw(`/commits/${encodeURIComponent(sha)}`, { method: "GET" });
+    if (res.status === 404) return null;
+    if (!res.ok) {
+      throw new Error(`getCommitBySha ${sha} failed: ${res.status}`);
+    }
+    return (await res.json()) as CommitMetaDto;
   }
 }
